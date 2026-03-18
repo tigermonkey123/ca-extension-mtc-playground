@@ -263,6 +263,24 @@ type WatcherConfig struct {
 
 	// BatchSize is the maximum number of certificates to fetch per poll.
 	BatchSize int `yaml:"batch_size"`
+
+	// HousekeepingInterval is how often to run cleanup tasks (0 = disabled).
+	HousekeepingInterval time.Duration `yaml:"housekeeping_interval"`
+
+	// StaleBundleRetention is how long to keep stale assertion bundles (default: 30 days).
+	StaleBundleRetention time.Duration `yaml:"stale_bundle_retention"`
+
+	// CheckpointRetention is how long to keep non-landmark checkpoints (default: 90 days).
+	CheckpointRetention time.Duration `yaml:"checkpoint_retention"`
+
+	// CheckpointKeepRecent is the minimum number of recent checkpoints to always keep (default: 1000).
+	CheckpointKeepRecent int `yaml:"checkpoint_keep_recent"`
+
+	// EventRetention is how long to keep admin events (default: 90 days).
+	EventRetention time.Duration `yaml:"event_retention"`
+
+	// EventKeepRecent is the minimum number of recent events to always keep (default: 5000).
+	EventKeepRecent int `yaml:"event_keep_recent"`
 }
 
 // CosignerConfig configures the primary signing key.
@@ -408,6 +426,24 @@ func applyDefaults(cfg *Config) {
 	}
 	if cfg.Watcher.BatchSize <= 0 {
 		cfg.Watcher.BatchSize = 100
+	}
+	if cfg.Watcher.HousekeepingInterval < 0 {
+		cfg.Watcher.HousekeepingInterval = 0
+	}
+	if cfg.Watcher.StaleBundleRetention <= 0 && cfg.Watcher.HousekeepingInterval > 0 {
+		cfg.Watcher.StaleBundleRetention = 30 * 24 * time.Hour // 30 days
+	}
+	if cfg.Watcher.CheckpointRetention <= 0 && cfg.Watcher.HousekeepingInterval > 0 {
+		cfg.Watcher.CheckpointRetention = 90 * 24 * time.Hour // 90 days
+	}
+	if cfg.Watcher.CheckpointKeepRecent <= 0 {
+		cfg.Watcher.CheckpointKeepRecent = 1000
+	}
+	if cfg.Watcher.EventRetention <= 0 && cfg.Watcher.HousekeepingInterval > 0 {
+		cfg.Watcher.EventRetention = 90 * 24 * time.Hour // 90 days
+	}
+	if cfg.Watcher.EventKeepRecent <= 0 {
+		cfg.Watcher.EventKeepRecent = 5000
 	}
 
 	if cfg.Cosigner.KeyID == "" {

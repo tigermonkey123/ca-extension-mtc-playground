@@ -30,6 +30,13 @@ type Config struct {
 	CheckpointInterval     time.Duration
 	BatchSize              int
 	RevocationPollInterval time.Duration
+	// Housekeeping settings.
+	HousekeepingInterval time.Duration // How often to run cleanup (0 = disabled).
+	StaleBundleRetention time.Duration // Delete stale assertion bundles older than this.
+	CheckpointRetention  time.Duration // Delete non-landmark checkpoints older than this.
+	CheckpointKeepRecent int           // Always keep at least this many recent checkpoints.
+	EventRetention       time.Duration // Delete events older than this.
+	EventKeepRecent      int           // Always keep at least this many recent events.
 }
 
 // CheckpointCallback is called after a new checkpoint is created.
@@ -120,6 +127,21 @@ func (w *Watcher) Run(ctx context.Context) error {
 		w.logger.Error("initial certificate poll failed", "error", err)
 	}
 
+	// Housekeeping ticker — only start if interval is configured.
+	var hkTicker *time.Ticker
+	var hkC <-chan time.Time
+	if w.cfg.HousekeepingInterval > 0 {
+		hkTicker = time.NewTicker(w.cfg.HousekeepingInterval)
+		hkC = hkTicker.C
+		defer hkTicker.Stop()
+		w.logger.Info("housekeeping enabled",
+			"interval", w.cfg.HousekeepingInterval,
+			"stale_bundle_retention", w.cfg.StaleBundleRetention,
+			"checkpoint_retention", w.cfg.CheckpointRetention,
+			"event_retention", w.cfg.EventRetention,
+		)
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -145,6 +167,9 @@ func (w *Watcher) Run(ctx context.Context) error {
 			if err := w.createCheckpoint(ctx); err != nil {
 				w.logger.Error("checkpoint creation failed", "error", err)
 			}
+
+		case <-hkC:
+			w.runHousekeeping(ctx)
 		}
 	}
 }
@@ -245,6 +270,36 @@ func (w *Watcher) createCheckpoint(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+// runHousekeeping performs periodic cleanup of stale data.
+func (w *Watcher) runHousekeeping(ctx context.Context) {
+	if w.cfg.StaleBundleRetention > 0 {
+		deleted, err := w.store.DeleteStaleAssertionBundles(ctx, w.cfg.StaleBundleRetention)
+		if err != nil {
+			w.logger.Error("housekeeping: delete stale bundles", "error", err)
+		} else if deleted > 0 {
+			w.logger.Info("housekeeping: deleted stale assertion bundles", "count", deleted)
+		}
+	}
+
+	if w.cfg.CheckpointRetention > 0 {
+		deleted, err := w.store.PruneOldCheckpoints(ctx, w.cfg.CheckpointRetention, w.cfg.CheckpointKeepRecent)
+		if err != nil {
+			w.logger.Error("housekeeping: prune checkpoints", "error", err)
+		} else if deleted > 0 {
+			w.logger.Info("housekeeping: pruned old checkpoints", "count", deleted)
+		}
+	}
+
+	if w.cfg.EventRetention > 0 {
+		deleted, err := w.store.PruneOldEvents(ctx, w.cfg.EventRetention, w.cfg.EventKeepRecent)
+		if err != nil {
+			w.logger.Error("housekeeping: prune events", "error", err)
+		} else if deleted > 0 {
+			w.logger.Info("housekeeping: pruned old events", "count", deleted)
+		}
+	}
 }
 
 // Stats returns watcher runtime statistics.

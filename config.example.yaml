@@ -45,6 +45,13 @@ watcher:
   revocation_poll_interval: 30s
   checkpoint_interval: 60s
   batch_size: 100
+  # Housekeeping (set housekeeping_interval to enable periodic cleanup).
+  # housekeeping_interval: 1h
+  # stale_bundle_retention: 720h    # 30 days
+  # checkpoint_retention: 2160h     # 90 days
+  # checkpoint_keep_recent: 1000
+  # event_retention: 2160h          # 90 days
+  # event_keep_recent: 5000
 
 cosigner:
   key_file: "${MTC_COSIGNER_KEY_FILE:-/etc/mtc-bridge/cosigner.key}"

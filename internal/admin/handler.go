@@ -393,37 +393,75 @@ func (h *Handler) handleStats(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) handleEvents(w http.ResponseWriter, r *http.Request) {
-	events, err := h.store.RecentEvents(r.Context(), 20)
+	page, _ := strconv.Atoi(r.URL.Query().Get("page"))
+	if page < 1 {
+		page = 1
+	}
+	pageSize := 20
+
+	result, err := h.store.PaginatedEvents(r.Context(), page, pageSize)
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	for _, e := range events {
+	for _, e := range result.Events {
 		fmt.Fprintf(w, `<tr class="border-b">
 			<td class="px-2 py-1 text-sm">%d</td>
 			<td class="px-2 py-1"><span class="px-2 py-0.5 rounded bg-blue-100 text-blue-800 text-xs">%s</span></td>
 			<td class="px-2 py-1 text-xs text-gray-500">%s</td>
 		</tr>`, e.ID, e.EventType, e.CreatedAt.Format("2006-01-02 15:04:05 UTC"))
 	}
+
+	totalPages := (result.Total + int64(pageSize) - 1) / int64(pageSize)
+	if totalPages > 1 {
+		fmt.Fprint(w, `<tr><td colspan="3" class="px-2 py-2 text-center">`)
+		fmt.Fprintf(w, `<span class="text-xs text-gray-500">Page %d of %d (%d total)</span> `, page, totalPages, result.Total)
+		if page > 1 {
+			fmt.Fprintf(w, `<button class="text-xs text-indigo-600 hover:underline mx-1" hx-get="/admin/events?page=%d" hx-target="closest tbody" hx-swap="innerHTML">&laquo; Prev</button>`, page-1)
+		}
+		if int64(page) < totalPages {
+			fmt.Fprintf(w, `<button class="text-xs text-indigo-600 hover:underline mx-1" hx-get="/admin/events?page=%d" hx-target="closest tbody" hx-swap="innerHTML">Next &raquo;</button>`, page+1)
+		}
+		fmt.Fprint(w, `</td></tr>`)
+	}
 }
 
 func (h *Handler) handleCheckpoints(w http.ResponseWriter, r *http.Request) {
-	checkpoints, err := h.store.RecentCheckpoints(r.Context(), 10)
+	page, _ := strconv.Atoi(r.URL.Query().Get("page"))
+	if page < 1 {
+		page = 1
+	}
+	pageSize := 10
+
+	result, err := h.store.PaginatedCheckpoints(r.Context(), page, pageSize)
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	for _, cp := range checkpoints {
+	for _, cp := range result.Checkpoints {
 		fmt.Fprintf(w, `<tr class="border-b">
 			<td class="px-2 py-1 text-sm">%d</td>
 			<td class="px-2 py-1 font-mono text-sm">%d</td>
 			<td class="px-2 py-1 font-mono text-xs">%x...</td>
 			<td class="px-2 py-1 text-xs text-gray-500">%s</td>
 		</tr>`, cp.ID, cp.TreeSize, cp.RootHash[:8], cp.CreatedAt.Format("2006-01-02 15:04:05 UTC"))
+	}
+
+	totalPages := (result.Total + int64(pageSize) - 1) / int64(pageSize)
+	if totalPages > 1 {
+		fmt.Fprint(w, `<tr><td colspan="4" class="px-2 py-2 text-center">`)
+		fmt.Fprintf(w, `<span class="text-xs text-gray-500">Page %d of %d (%d total)</span> `, page, totalPages, result.Total)
+		if page > 1 {
+			fmt.Fprintf(w, `<button class="text-xs text-indigo-600 hover:underline mx-1" hx-get="/admin/checkpoints?page=%d" hx-target="closest tbody" hx-swap="innerHTML">&laquo; Prev</button>`, page-1)
+		}
+		if int64(page) < totalPages {
+			fmt.Fprintf(w, `<button class="text-xs text-indigo-600 hover:underline mx-1" hx-get="/admin/checkpoints?page=%d" hx-target="closest tbody" hx-swap="innerHTML">Next &raquo;</button>`, page+1)
+		}
+		fmt.Fprint(w, `</td></tr>`)
 	}
 }
 
@@ -963,8 +1001,8 @@ func (h *Handler) handleVizSubtree(w http.ResponseWriter, r *http.Request) {
 		Revoked    bool   `json:"revoked,omitempty"`
 	}
 	type subtreeLevel struct {
-		Level int            `json:"level"`
-		Nodes []subtreeNode  `json:"nodes"`
+		Level int           `json:"level"`
+		Nodes []subtreeNode `json:"nodes"`
 	}
 
 	depth := 0

@@ -1120,11 +1120,11 @@ func (s *Store) RecentEventsByType(ctx context.Context, eventType string, limit 
 	return events, rows.Err()
 }
 
-// EventsSince returns events with ID > sinceID.
+// EventsSince returns events with ID > sinceID, limited to the 100 most recent.
 func (s *Store) EventsSince(ctx context.Context, sinceID int64) ([]*Event, error) {
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT id, event_type, payload, created_at
-		 FROM events WHERE id > $1 ORDER BY id ASC`, sinceID)
+		 FROM events WHERE id > $1 ORDER BY id ASC LIMIT 100`, sinceID)
 	if err != nil {
 		return nil, fmt.Errorf("store.EventsSince: %w", err)
 	}
@@ -2076,6 +2076,149 @@ func (s *Store) LatestLandmark(ctx context.Context) (*Landmark, error) {
 		return nil, fmt.Errorf("store.LatestLandmark: %w", err)
 	}
 	return &lm, nil
+}
+
+// --- Housekeeping ---
+
+// DeleteStaleAssertionBundles removes assertion bundles that have been stale
+// for longer than the given retention period.
+func (s *Store) DeleteStaleAssertionBundles(ctx context.Context, olderThan time.Duration) (int64, error) {
+	cutoff := time.Now().UTC().Add(-olderThan)
+	result, err := s.db.ExecContext(ctx,
+		`DELETE FROM assertion_bundles WHERE stale = TRUE AND updated_at < $1`, cutoff)
+	if err != nil {
+		return 0, fmt.Errorf("store.DeleteStaleAssertionBundles: %w", err)
+	}
+	return result.RowsAffected()
+}
+
+// PruneOldCheckpoints removes non-landmark checkpoints older than the given
+// retention period, keeping at least the most recent keepRecent checkpoints.
+func (s *Store) PruneOldCheckpoints(ctx context.Context, olderThan time.Duration, keepRecent int) (int64, error) {
+	if keepRecent < 10 {
+		keepRecent = 10
+	}
+	cutoff := time.Now().UTC().Add(-olderThan)
+	result, err := s.db.ExecContext(ctx,
+		`DELETE FROM checkpoints
+		 WHERE created_at < $1
+		   AND id NOT IN (SELECT id FROM checkpoints ORDER BY id DESC LIMIT $2)
+		   AND tree_size NOT IN (SELECT tree_size FROM landmarks)`,
+		cutoff, keepRecent)
+	if err != nil {
+		return 0, fmt.Errorf("store.PruneOldCheckpoints: %w", err)
+	}
+	return result.RowsAffected()
+}
+
+// PruneOldEvents removes events older than the given retention period,
+// keeping at least the most recent keepRecent events.
+func (s *Store) PruneOldEvents(ctx context.Context, olderThan time.Duration, keepRecent int) (int64, error) {
+	if keepRecent < 100 {
+		keepRecent = 100
+	}
+	cutoff := time.Now().UTC().Add(-olderThan)
+	result, err := s.db.ExecContext(ctx,
+		`DELETE FROM events
+		 WHERE created_at < $1
+		   AND id NOT IN (SELECT id FROM events ORDER BY id DESC LIMIT $2)`,
+		cutoff, keepRecent)
+	if err != nil {
+		return 0, fmt.Errorf("store.PruneOldEvents: %w", err)
+	}
+	return result.RowsAffected()
+}
+
+// CheckpointPage holds a page of checkpoints along with total count.
+type CheckpointPage struct {
+	Checkpoints []*Checkpoint `json:"checkpoints"`
+	Total       int64         `json:"total"`
+	Page        int           `json:"page"`
+	PageSize    int           `json:"pageSize"`
+}
+
+// PaginatedCheckpoints returns a page of checkpoints ordered by ID descending.
+func (s *Store) PaginatedCheckpoints(ctx context.Context, page, pageSize int) (*CheckpointPage, error) {
+	if page < 1 {
+		page = 1
+	}
+	if pageSize < 1 || pageSize > 100 {
+		pageSize = 10
+	}
+
+	var total int64
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM checkpoints`).Scan(&total); err != nil {
+		return nil, fmt.Errorf("store.PaginatedCheckpoints: count: %w", err)
+	}
+
+	offset := (page - 1) * pageSize
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, tree_size, root_hash, timestamp, signature, body, created_at
+		 FROM checkpoints ORDER BY id DESC LIMIT $1 OFFSET $2`, pageSize, offset)
+	if err != nil {
+		return nil, fmt.Errorf("store.PaginatedCheckpoints: %w", err)
+	}
+	defer rows.Close()
+
+	var cps []*Checkpoint
+	for rows.Next() {
+		var cp Checkpoint
+		if err := rows.Scan(&cp.ID, &cp.TreeSize, &cp.RootHash, &cp.Timestamp, &cp.Signature, &cp.Body, &cp.CreatedAt); err != nil {
+			return nil, fmt.Errorf("store.PaginatedCheckpoints: scan: %w", err)
+		}
+		cps = append(cps, &cp)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store.PaginatedCheckpoints: rows: %w", err)
+	}
+
+	return &CheckpointPage{Checkpoints: cps, Total: total, Page: page, PageSize: pageSize}, nil
+}
+
+// EventPage holds a page of events along with total count.
+type EventPage struct {
+	Events   []*Event `json:"events"`
+	Total    int64    `json:"total"`
+	Page     int      `json:"page"`
+	PageSize int      `json:"pageSize"`
+}
+
+// PaginatedEvents returns a page of events ordered by ID descending.
+func (s *Store) PaginatedEvents(ctx context.Context, page, pageSize int) (*EventPage, error) {
+	if page < 1 {
+		page = 1
+	}
+	if pageSize < 1 || pageSize > 100 {
+		pageSize = 20
+	}
+
+	var total int64
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM events`).Scan(&total); err != nil {
+		return nil, fmt.Errorf("store.PaginatedEvents: count: %w", err)
+	}
+
+	offset := (page - 1) * pageSize
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, event_type, payload, created_at
+		 FROM events ORDER BY id DESC LIMIT $1 OFFSET $2`, pageSize, offset)
+	if err != nil {
+		return nil, fmt.Errorf("store.PaginatedEvents: %w", err)
+	}
+	defer rows.Close()
+
+	var events []*Event
+	for rows.Next() {
+		var e Event
+		if err := rows.Scan(&e.ID, &e.EventType, &e.Payload, &e.CreatedAt); err != nil {
+			return nil, fmt.Errorf("store.PaginatedEvents: scan: %w", err)
+		}
+		events = append(events, &e)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store.PaginatedEvents: rows: %w", err)
+	}
+
+	return &EventPage{Events: events, Total: total, Page: page, PageSize: pageSize}, nil
 }
 
 // ListLandmarks returns all landmarks ordered by tree size.

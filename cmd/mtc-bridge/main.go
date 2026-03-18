@@ -145,6 +145,12 @@ func main() {
 		CheckpointInterval:     cfg.Watcher.CheckpointInterval,
 		BatchSize:              cfg.Watcher.BatchSize,
 		RevocationPollInterval: cfg.Watcher.RevocationPollInterval,
+		HousekeepingInterval:   cfg.Watcher.HousekeepingInterval,
+		StaleBundleRetention:   cfg.Watcher.StaleBundleRetention,
+		CheckpointRetention:    cfg.Watcher.CheckpointRetention,
+		CheckpointKeepRecent:   cfg.Watcher.CheckpointKeepRecent,
+		EventRetention:         cfg.Watcher.EventRetention,
+		EventKeepRecent:        cfg.Watcher.EventKeepRecent,
 	}
 	w := watcher.New(caAdapter, stateStore, ilog, revMgr, watcherCfg, logger.With("component", "watcher"))
 
