@@ -437,6 +437,36 @@ func TestInclusionProofFromNodes(t *testing.T) {
 	}
 }
 
+func TestInclusionProofFromNodesForRange(t *testing.T) {
+	entries := [][]byte{
+		[]byte("leaf-0"),
+		[]byte("leaf-1"),
+		[]byte("leaf-2"),
+		[]byte("leaf-3"),
+		[]byte("leaf-4"),
+		[]byte("leaf-5"),
+	}
+	leafHashes := make([]Hash, len(entries))
+	for i, entry := range entries {
+		leafHashes[i] = LeafHash(entry)
+	}
+	nodeAt := func(level int, idx int64) Hash {
+		start := idx << uint(level)
+		end := start + (int64(1) << uint(level))
+		return SubtreeHash(start, end, func(i int64) Hash { return leafHashes[i] })
+	}
+
+	proof, err := InclusionProofFromNodesForRange(4, 2, 6, nodeAt)
+	if err != nil {
+		t.Fatalf("InclusionProofFromNodesForRange: %v", err)
+	}
+	root := RootFromInclusionProof(2, 4, leafHashes[4], proof)
+	want := SubtreeHash(2, 6, func(i int64) Hash { return leafHashes[i] })
+	if root != want {
+		t.Fatalf("range proof root = %x, want %x", root, want)
+	}
+}
+
 func TestInclusionProofFromNodesBoundary(t *testing.T) {
 	_, err := InclusionProofFromNodes(-1, 4, nil)
 	if err == nil {

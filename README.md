@@ -239,7 +239,7 @@ cd ca-extension-merkle
 # 2. Build
 make build
 
-# 3. Generate a cosigner key (first time only)
+# 3. Generate a post-quantum ML-DSA-44 cosigner key (first time only)
 make generate-key
 
 # 4. Configure environment (copy and edit .env with your CA credentials)
@@ -1328,7 +1328,7 @@ sections:
 - **`state_db`** — PostgreSQL connection for the Merkle tree state
 - **`ca_db`** — MariaDB connection for the DigiCert CA database (read-only)
 - **`watcher`** — Polling intervals for certificates and revocations
-- **`cosigner`** — Primary cosigner: key file, key ID, algorithm (`ed25519`, `mldsa44`, `mldsa65`, `mldsa87`), cosigner_id
+- **`cosigner`** — Primary cosigner: key file, key ID, algorithm (`mldsa44` by default; also supports `ed25519`, `mldsa65`, `mldsa87`), cosigner_id
 - **`additional_cosigners`** — Additional cosigners for multi-cosigner subtree signing
 - **`batch`** — Batch processing: enabled, window duration, min_size
 - **`landmarks`** — Landmark designation: enabled, interval

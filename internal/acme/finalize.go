@@ -22,9 +22,12 @@ import (
 	"time"
 
 	"github.com/briantrzupek/ca-extension-merkle/internal/issuancelog"
+	"github.com/briantrzupek/ca-extension-merkle/internal/landmark"
 	"github.com/briantrzupek/ca-extension-merkle/internal/localca"
 	"github.com/briantrzupek/ca-extension-merkle/internal/merkle"
+	"github.com/briantrzupek/ca-extension-merkle/internal/mtccert"
 	"github.com/briantrzupek/ca-extension-merkle/internal/mtcformat"
+	"github.com/briantrzupek/ca-extension-merkle/internal/store"
 )
 
 func (srv *Server) handleFinalize(w http.ResponseWriter, r *http.Request) {
@@ -284,10 +287,12 @@ func (srv *Server) processFinalizeMTC(ctx context.Context, orderID string, csr *
 	}
 
 	// Step 1: Build TBSCertificateLogEntry from CSR fields.
+	notBefore := time.Now().UTC().Truncate(time.Second)
+	notAfter := notBefore.Add(srv.localCA.DefaultValidity())
 	logEntryDER, err := mtcformat.BuildLogEntryFromCSR(
 		srv.cfg.MTCBridgeURL,
-		time.Now().UTC().Truncate(time.Second),
-		time.Now().UTC().Truncate(time.Second).Add(90*24*time.Hour),
+		notBefore,
+		notAfter,
 		csr, dnsNames,
 	)
 	if err != nil {
@@ -346,7 +351,7 @@ func (srv *Server) processFinalizeMTC(ctx context.Context, orderID string, csr *
 		return
 	}
 
-	// Step 4: Build MTCProof (signatureless mode).
+	// Step 4: Build MTCProof.
 	proofBytes := make([][]byte, len(proofHashes))
 	for i, h := range proofHashes {
 		ph := make([]byte, merkle.HashSize)
@@ -354,15 +359,80 @@ func (srv *Server) processFinalizeMTC(ctx context.Context, orderID string, csr *
 		proofBytes[i] = ph
 	}
 
+	var signatures []mtcformat.MTCSignature
+	if srv.cfg.MTCProfile == "standalone" {
+		if len(srv.cosigners) == 0 {
+			srv.logger.Error("acme: MTC standalone profile requires at least one cosigner", "order_id", orderID)
+			srv.store.UpdateACMEOrderStatus(ctx, orderID, "invalid", map[string]interface{}{
+				"error_type":   "serverInternal",
+				"error_detail": "MTC standalone profile requires at least one cosigner",
+			})
+			return
+		}
+
+		var subtreeHash merkle.Hash
+		if len(cp.RootHash) != merkle.HashSize {
+			srv.logger.Error("acme: invalid checkpoint root hash size", "order_id", orderID, "size", len(cp.RootHash))
+			srv.store.UpdateACMEOrderStatus(ctx, orderID, "invalid", map[string]interface{}{
+				"error_type":   "serverInternal",
+				"error_detail": "invalid checkpoint root hash size",
+			})
+			return
+		}
+		copy(subtreeHash[:], cp.RootHash)
+
+		for _, cs := range srv.cosigners {
+			sig, err := cs.SignSubtreeMTC([]byte(srv.cfg.MTCBridgeURL), 0, cp.TreeSize, subtreeHash)
+			if err != nil {
+				srv.logger.Warn("acme: MTC subtree signature failed",
+					"order_id", orderID,
+					"cosigner_id", string(cs.CosignerID()),
+					"algorithm", cs.Algorithm().String(),
+					"error", err,
+				)
+				continue
+			}
+			signatures = append(signatures, sig)
+
+			hashBytes := make([]byte, merkle.HashSize)
+			copy(hashBytes, subtreeHash[:])
+			cpID := cp.ID
+			if err := srv.store.SaveSubtreeSignature(ctx, &store.SubtreeSignature{
+				StartIdx:     0,
+				EndIdx:       cp.TreeSize,
+				SubtreeHash:  hashBytes,
+				CosignerID:   string(sig.CosignerID),
+				Algorithm:    int16(cs.Algorithm()),
+				Signature:    sig.Signature,
+				CheckpointID: &cpID,
+			}); err != nil {
+				srv.logger.Warn("acme: store MTC subtree signature failed",
+					"order_id", orderID,
+					"cosigner_id", string(sig.CosignerID),
+					"error", err,
+				)
+			}
+		}
+
+		if len(signatures) == 0 {
+			srv.logger.Error("acme: no MTC subtree signatures produced", "order_id", orderID)
+			srv.store.UpdateACMEOrderStatus(ctx, orderID, "invalid", map[string]interface{}{
+				"error_type":   "serverInternal",
+				"error_detail": "no MTC subtree signatures produced",
+			})
+			return
+		}
+	}
+
 	proof := &mtcformat.MTCProof{
 		Start:          0,
 		End:            uint64(cp.TreeSize),
 		InclusionProof: proofBytes,
-		Signatures:     nil, // signatureless mode
+		Signatures:     signatures,
 	}
 
 	// Step 5: Build MTC certificate.
-	finalCertDER, err := srv.localCA.IssueMTCCert(csr, dnsNames, 0, leafIdx, proof, srv.cfg.MTCBridgeURL)
+	finalCertDER, err := srv.localCA.IssueMTCCertWithValidity(csr, dnsNames, notBefore, notAfter, leafIdx, proof, srv.cfg.MTCBridgeURL)
 	if err != nil {
 		srv.logger.Error("acme: MTC cert build failed", "order_id", orderID, "error", err)
 		srv.store.UpdateACMEOrderStatus(ctx, orderID, "invalid", map[string]interface{}{
@@ -463,6 +533,89 @@ func (srv *Server) handleCertificate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/pem-certificate-chain")
+	w.Write(certPEM)
+}
+
+func (srv *Server) handleLandmarkCertificate(w http.ResponseWriter, r *http.Request) {
+	orderID := r.PathValue("id")
+	order, err := srv.store.GetACMEOrder(r.Context(), orderID)
+	if err != nil {
+		acmeError(w, http.StatusNotFound, "orderNotFound", "order not found")
+		return
+	}
+	if order.Status != "valid" {
+		acmeError(w, http.StatusForbidden, "orderNotReady", "certificate not yet available")
+		return
+	}
+
+	finalDER, caDER, err := srv.store.GetOrderFinalCertDER(r.Context(), orderID)
+	if err != nil || len(finalDER) == 0 {
+		acmeError(w, http.StatusNotFound, "orderNotFound", "standalone MTC certificate not found")
+		return
+	}
+
+	parsed, err := mtccert.ParseMTCCertificate(finalDER)
+	if err != nil {
+		acmeError(w, http.StatusBadRequest, "serverInternal", "stored certificate is not an MTC certificate")
+		return
+	}
+	landmarks, err := srv.store.ListLandmarks(r.Context())
+	if err != nil {
+		acmeError(w, http.StatusInternalServerError, "serverInternal", "failed to load landmarks")
+		return
+	}
+	points := landmark.AllPoints(landmarks)
+	prev, current, ok := landmark.FindContainingInterval(points, parsed.SerialNumber)
+	if !ok {
+		retryAfter := int(srv.cfg.AssertionPollInterval.Seconds())
+		if retryAfter <= 0 {
+			retryAfter = 60
+		}
+		w.Header().Set("Retry-After", fmt.Sprintf("%d", retryAfter))
+		acmeError(w, http.StatusServiceUnavailable, "serverInternal", "no landmark contains this certificate yet")
+		return
+	}
+
+	nodeAt := func(level int, idx int64) merkle.Hash {
+		h, _ := srv.store.GetTreeNode(r.Context(), level, idx)
+		return h
+	}
+	proofHashes, err := merkle.InclusionProofFromNodesForRange(parsed.SerialNumber, prev.TreeSize, current.TreeSize, nodeAt)
+	if err != nil {
+		acmeError(w, http.StatusInternalServerError, "serverInternal", "failed to compute landmark proof")
+		return
+	}
+	proofBytes := make([][]byte, len(proofHashes))
+	for i, h := range proofHashes {
+		ph := make([]byte, merkle.HashSize)
+		copy(ph, h[:])
+		proofBytes[i] = ph
+	}
+	proof := &mtcformat.MTCProof{
+		Start:          uint64(prev.TreeSize),
+		End:            uint64(current.TreeSize),
+		InclusionProof: proofBytes,
+		Signatures:     nil,
+	}
+	certDER, err := mtccert.BuildMTCCertificate(mtccert.TBSFields{
+		Issuer:            parsed.RawIssuer,
+		NotBefore:         parsed.NotBefore,
+		NotAfter:          parsed.NotAfter,
+		Subject:           parsed.RawSubject,
+		SubjectPubKeyInfo: parsed.SubjectPubKeyInfo,
+		Extensions:        parsed.Extensions,
+	}, parsed.SerialNumber, proof)
+	if err != nil {
+		acmeError(w, http.StatusInternalServerError, "serverInternal", "failed to build landmark certificate")
+		return
+	}
+
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
+	if len(caDER) > 0 {
+		certPEM = append(certPEM, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caDER})...)
+	}
+	w.Header().Set("Content-Type", "application/pem-certificate-chain")
+	w.Header().Set("X-MTC-Landmark-Number", fmt.Sprintf("%d", current.Number))
 	w.Write(certPEM)
 }
 

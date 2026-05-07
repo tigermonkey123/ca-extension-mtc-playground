@@ -129,6 +129,13 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.mux.ServeHTTP(w, r)
 }
 
+func (h *Handler) watcherStats() watcher.Stats {
+	if h.watcher == nil {
+		return watcher.Stats{}
+	}
+	return h.watcher.GetStats()
+}
+
 func (h *Handler) handleACMEDemo(w http.ResponseWriter, r *http.Request) {
 	data := struct {
 		ACMEExternalURL string
@@ -182,7 +189,7 @@ func (h *Handler) handleDashboard(w http.ResponseWriter, r *http.Request) {
 		checkpoints = nil
 	}
 
-	watcherStats := h.watcher.GetStats()
+	watcherStats := h.watcherStats()
 
 	assertionStats, err := h.store.GetAssertionStats(r.Context())
 	if err != nil {
@@ -262,7 +269,7 @@ func (h *Handler) handleStats(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
-	watcherStats := h.watcher.GetStats()
+	watcherStats := h.watcherStats()
 
 	assertionStats, _ := h.store.GetAssertionStats(r.Context())
 	if assertionStats == nil {
@@ -274,6 +281,10 @@ func (h *Handler) handleStats(w http.ResponseWriter, r *http.Request) {
 
 	watcherStatusClass := "text-red-600"
 	watcherStatusText := "Stopped"
+	if h.watcher == nil {
+		watcherStatusClass = "text-gray-500"
+		watcherStatusText = "Disabled"
+	}
 	if watcherStats.Running {
 		watcherStatusClass = "text-green-600"
 		watcherStatusText = "Running"

@@ -35,6 +35,7 @@ import (
 	"time"
 
 	"github.com/briantrzupek/ca-extension-merkle/internal/assertion"
+	"github.com/briantrzupek/ca-extension-merkle/internal/landmark"
 	"github.com/briantrzupek/ca-extension-merkle/internal/merkle"
 	"github.com/briantrzupek/ca-extension-merkle/internal/revocation"
 	"github.com/briantrzupek/ca-extension-merkle/internal/store"
@@ -47,16 +48,22 @@ type Handler struct {
 	assertBld *assertion.Builder
 	logger    *slog.Logger
 	mux       *http.ServeMux
+	maxActive int
 }
 
 // New creates a new tlog-tiles Handler.
-func New(s *store.Store, revMgr *revocation.Manager, logOrigin string, logger *slog.Logger) *Handler {
+func New(s *store.Store, revMgr *revocation.Manager, logOrigin string, logger *slog.Logger, maxActive ...int) *Handler {
+	active := 0
+	if len(maxActive) > 0 {
+		active = maxActive[0]
+	}
 	h := &Handler{
 		store:     s,
 		revMgr:    revMgr,
 		assertBld: assertion.NewBuilder(s, logOrigin),
 		logger:    logger,
 		mux:       http.NewServeMux(),
+		maxActive: active,
 	}
 	h.mux.HandleFunc("GET /checkpoint", h.handleCheckpoint)
 	h.mux.HandleFunc("GET /tile/", h.handleTile)
@@ -68,6 +75,8 @@ func New(s *store.Store, revMgr *revocation.Manager, logOrigin string, logger *s
 	h.mux.HandleFunc("GET /assertions/pending", h.handleAssertionsPending)
 	h.mux.HandleFunc("GET /assertions/stats", h.handleAssertionsStats)
 	h.mux.HandleFunc("GET /landmarks", h.handleLandmarks)
+	h.mux.HandleFunc("GET /landmarks.txt", h.handleLandmarksText)
+	h.mux.HandleFunc("GET /trusted-subtrees", h.handleTrustedSubtrees)
 	h.mux.HandleFunc("GET /landmark/{tree_size}", h.handleLandmarkByTreeSize)
 	return h
 }
@@ -595,19 +604,79 @@ func (h *Handler) handleLandmarks(w http.ResponseWriter, r *http.Request) {
 	}
 
 	type landmarkJSON struct {
-		TreeSize     int64  `json:"tree_size"`
-		RootHash     string `json:"root_hash"`
-		CheckpointID int64  `json:"checkpoint_id"`
-		CreatedAt    string `json:"created_at"`
+		LandmarkNumber int64  `json:"landmark_number"`
+		TreeSize       int64  `json:"tree_size"`
+		RootHash       string `json:"root_hash"`
+		CheckpointID   int64  `json:"checkpoint_id"`
+		CreatedAt      string `json:"created_at"`
 	}
 
 	result := make([]landmarkJSON, len(landmarks))
 	for i, lm := range landmarks {
 		result[i] = landmarkJSON{
-			TreeSize:     lm.TreeSize,
-			RootHash:     hex.EncodeToString(lm.RootHash),
-			CheckpointID: lm.CheckpointID,
-			CreatedAt:    lm.CreatedAt.Format(time.RFC3339),
+			LandmarkNumber: int64(i + 1),
+			TreeSize:       lm.TreeSize,
+			RootHash:       hex.EncodeToString(lm.RootHash),
+			CheckpointID:   lm.CheckpointID,
+			CreatedAt:      lm.CreatedAt.Format(time.RFC3339),
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-cache")
+	json.NewEncoder(w).Encode(result)
+}
+
+// handleLandmarksText returns a draft-style landmarks list:
+//
+//	<last_landmark> <num_active_landmarks>
+//	<tree_size of last landmark>
+//	<tree_size of previous landmark>
+//	...
+func (h *Handler) handleLandmarksText(w http.ResponseWriter, r *http.Request) {
+	landmarks, err := h.store.ListLandmarks(r.Context())
+	if err != nil {
+		h.logger.Error("list landmarks", "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	points := landmark.ActivePoints(landmarks, h.maxActive)
+	if len(points) == 0 {
+		points = []landmark.Point{{Number: 0, TreeSize: 0}}
+	}
+	last := points[len(points)-1]
+
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache")
+	fmt.Fprintf(w, "%d %d\n", last.Number, len(points))
+	for i := len(points) - 1; i >= 0; i-- {
+		fmt.Fprintf(w, "%d\n", points[i].TreeSize)
+	}
+}
+
+// handleTrustedSubtrees returns demo-friendly JSON trust material for
+// signatureless landmark-relative certificate verification.
+func (h *Handler) handleTrustedSubtrees(w http.ResponseWriter, r *http.Request) {
+	subtrees, err := landmark.TrustedSubtrees(r.Context(), h.store, h.maxActive)
+	if err != nil {
+		h.logger.Error("trusted subtrees", "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
+	type subtreeJSON struct {
+		LandmarkNumber int64  `json:"landmark_number"`
+		Start          int64  `json:"start"`
+		End            int64  `json:"end"`
+		RootHash       string `json:"root_hash"`
+	}
+	result := make([]subtreeJSON, len(subtrees))
+	for i, st := range subtrees {
+		result[i] = subtreeJSON{
+			LandmarkNumber: st.LandmarkNumber,
+			Start:          st.Start,
+			End:            st.End,
+			RootHash:       hex.EncodeToString(st.RootHash[:]),
 		}
 	}
 

@@ -56,6 +56,9 @@ type Config struct {
 
 	// LocalCA configures the optional local intermediate CA for embedded proof issuance.
 	LocalCA LocalCAConfig `yaml:"local_ca"`
+
+	// Landmarks configures automatic landmark allocation.
+	Landmarks LandmarkConfig `yaml:"landmarks"`
 }
 
 // ACMEConfig configures the ACME server.
@@ -121,6 +124,20 @@ type AssertionIssuerConfig struct {
 	Webhooks []WebhookConfig `yaml:"webhooks"`
 }
 
+// LandmarkConfig configures automatic landmark allocation and publication.
+type LandmarkConfig struct {
+	// Enabled turns automatic landmark allocation on/off.
+	Enabled bool `yaml:"enabled"`
+
+	// Interval is how often the latest checkpoint should be designated as a
+	// landmark when the tree has advanced.
+	Interval time.Duration `yaml:"interval"`
+
+	// MaxActiveLandmarks limits publication to the most recent N landmarks. A
+	// zero value publishes all landmarks.
+	MaxActiveLandmarks int `yaml:"max_active_landmarks"`
+}
+
 // IsEnabled returns whether the assertion issuer is enabled.
 // Defaults to true if not explicitly set.
 func (c AssertionIssuerConfig) IsEnabled() bool {
@@ -152,6 +169,10 @@ type LocalCAConfig struct {
 	// When true, certificates use signatureAlgorithm = id-alg-mtcProof
 	// with the MTCProof in signatureValue instead of a cryptographic signature.
 	MTCMode bool `yaml:"mtc_mode"`
+
+	// MTCProfile selects the MTC certificate proof profile.
+	// Supported values: "signatureless" (default), "standalone".
+	MTCProfile string `yaml:"mtc_profile"`
 
 	// KeyFile is the path to the ECDSA P-256 private key (PEM).
 	KeyFile string `yaml:"key_file"`
@@ -214,6 +235,10 @@ func (c PostgresConfig) DSN() string {
 
 // MariaDBConfig configures the DigiCert CA MariaDB connection.
 type MariaDBConfig struct {
+	// Enabled controls whether mtc-bridge connects to the DigiCert CA database.
+	// Defaults to true for existing DigiCert-backed deployments.
+	Enabled *bool `yaml:"enabled"`
+
 	Host     string `yaml:"host"`
 	Port     int    `yaml:"port"`
 	Database string `yaml:"database"`
@@ -222,6 +247,14 @@ type MariaDBConfig struct {
 
 	// IssuerID filters certificates to a specific CA issuer. Empty means all.
 	IssuerID string `yaml:"issuer_id"`
+}
+
+// IsEnabled returns whether the DigiCert CA database integration is enabled.
+func (c MariaDBConfig) IsEnabled() bool {
+	if c.Enabled == nil {
+		return true
+	}
+	return *c.Enabled
 }
 
 // DSN returns the MariaDB connection string for go-sql-driver/mysql.
@@ -292,7 +325,7 @@ type CosignerConfig struct {
 	KeyID string `yaml:"key_id"`
 
 	// Algorithm is the signature algorithm: "ed25519", "mldsa44", "mldsa65", "mldsa87".
-	// Default: "ed25519".
+	// Default: "mldsa44".
 	Algorithm string `yaml:"algorithm"`
 
 	// CosignerID is the numeric identifier for MTCSignature (default: 0).
@@ -449,6 +482,9 @@ func applyDefaults(cfg *Config) {
 	if cfg.Cosigner.KeyID == "" {
 		cfg.Cosigner.KeyID = "mtc-bridge-cosigner"
 	}
+	if cfg.Cosigner.Algorithm == "" {
+		cfg.Cosigner.Algorithm = "mldsa44"
+	}
 
 	if cfg.Logging.Level == "" {
 		cfg.Logging.Level = "info"
@@ -466,6 +502,9 @@ func applyDefaults(cfg *Config) {
 	}
 	if cfg.AssertionIssuer.StalenessThreshold <= 0 {
 		cfg.AssertionIssuer.StalenessThreshold = 5
+	}
+	if cfg.Landmarks.Interval <= 0 {
+		cfg.Landmarks.Interval = time.Hour
 	}
 
 	// ACME defaults.
@@ -486,6 +525,9 @@ func applyDefaults(cfg *Config) {
 	}
 	if cfg.ACME.AssertionPollInterval <= 0 {
 		cfg.ACME.AssertionPollInterval = 5 * time.Second
+	}
+	if cfg.LocalCA.MTCProfile == "" {
+		cfg.LocalCA.MTCProfile = "signatureless"
 	}
 }
 
@@ -515,20 +557,44 @@ func (c *Config) Validate() error {
 	if c.StateDB.Username == "" {
 		errs = append(errs, "state_db.username is required")
 	}
-	if c.CADB.Host == "" {
-		errs = append(errs, "ca_db.host is required")
-	}
-	if c.CADB.Username == "" {
-		errs = append(errs, "ca_db.username is required")
+	if c.CADB.IsEnabled() {
+		if c.CADB.Host == "" {
+			errs = append(errs, "ca_db.host is required")
+		}
+		if c.CADB.Username == "" {
+			errs = append(errs, "ca_db.username is required")
+		}
 	}
 	if c.Cosigner.KeyFile == "" {
 		errs = append(errs, "cosigner.key_file is required")
+	}
+	if _, err := cosignerAlgorithm(c.Cosigner.Algorithm); err != nil {
+		errs = append(errs, "cosigner.algorithm must be ed25519, mldsa44, mldsa65, or mldsa87")
+	}
+	for i, additional := range c.AdditionalCosigners {
+		if _, err := cosignerAlgorithm(additional.Algorithm); err != nil {
+			errs = append(errs, fmt.Sprintf("additional_cosigners[%d].algorithm must be ed25519, mldsa44, mldsa65, or mldsa87", i))
+		}
+	}
+	switch strings.ToLower(c.LocalCA.MTCProfile) {
+	case "", "signatureless", "standalone":
+	default:
+		errs = append(errs, "local_ca.mtc_profile must be signatureless or standalone")
 	}
 
 	if len(errs) > 0 {
 		return fmt.Errorf("config.Validate: %s", strings.Join(errs, "; "))
 	}
 	return nil
+}
+
+func cosignerAlgorithm(alg string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(alg)) {
+	case "", "ed25519", "mldsa44", "ml-dsa-44", "mldsa65", "ml-dsa-65", "mldsa87", "ml-dsa-87":
+		return alg, nil
+	default:
+		return "", fmt.Errorf("unknown cosigner algorithm %q", alg)
+	}
 }
 
 // String returns a redacted summary for logging.

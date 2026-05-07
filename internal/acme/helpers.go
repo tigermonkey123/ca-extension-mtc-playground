@@ -11,6 +11,7 @@ package acme
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"time"
 
@@ -92,6 +93,9 @@ func (srv *Server) renderOrder(order *store.ACMEOrder, authzURLs []string) map[s
 }
 
 func (srv *Server) renderChallenge(w http.ResponseWriter, ch *store.ACMEChallenge) {
+	if ch.AuthzID != "" {
+		w.Header().Add("Link", fmt.Sprintf("<%s>; rel=\"up\"", srv.authzURL(ch.AuthzID)))
+	}
 	resp := map[string]interface{}{
 		"type":   ch.Type,
 		"url":    srv.challengeURL(ch.ID),

@@ -58,6 +58,9 @@ func TestApplyDefaults(t *testing.T) {
 	if cfg.HTTP.Addr != ":8080" {
 		t.Errorf("default http addr = %q, want %q", cfg.HTTP.Addr, ":8080")
 	}
+	if cfg.Cosigner.Algorithm != "mldsa44" {
+		t.Errorf("default cosigner algorithm = %q, want %q", cfg.Cosigner.Algorithm, "mldsa44")
+	}
 }
 
 func TestPostgresDSN(t *testing.T) {
@@ -107,6 +110,22 @@ func TestValidate(t *testing.T) {
 	err = cfg.Validate()
 	if err != nil {
 		t.Errorf("unexpected validation error: %v", err)
+	}
+}
+
+func TestValidateWithDisabledCADB(t *testing.T) {
+	disabled := false
+	cfg := &Config{
+		CADB: MariaDBConfig{Enabled: &disabled},
+	}
+	applyDefaults(cfg)
+	cfg.StateDB.Host = "localhost"
+	cfg.StateDB.Username = "user"
+	cfg.Cosigner.KeyFile = "/etc/mtc-bridge/key.pem"
+
+	err := cfg.Validate()
+	if err != nil {
+		t.Errorf("unexpected validation error with disabled ca_db: %v", err)
 	}
 }
 

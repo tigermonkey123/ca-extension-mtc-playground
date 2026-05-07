@@ -14,6 +14,8 @@ package main
 
 import (
 	"context"
+	"encoding/hex"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -21,6 +23,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -31,6 +34,7 @@ import (
 	"github.com/briantrzupek/ca-extension-merkle/internal/config"
 	"github.com/briantrzupek/ca-extension-merkle/internal/cosigner"
 	"github.com/briantrzupek/ca-extension-merkle/internal/issuancelog"
+	"github.com/briantrzupek/ca-extension-merkle/internal/landmark"
 	"github.com/briantrzupek/ca-extension-merkle/internal/localca"
 	"github.com/briantrzupek/ca-extension-merkle/internal/revocation"
 	"github.com/briantrzupek/ca-extension-merkle/internal/store"
@@ -40,18 +44,29 @@ import (
 
 func main() {
 	configFile := flag.String("config", "config.yaml", "path to configuration file")
-	generateKey := flag.String("generate-key", "", "generate a new Ed25519 key and exit")
+	generateKey := flag.String("generate-key", "", "generate a new cosigner key and exit")
+	generateKeyAlg := flag.String("generate-key-alg", "mldsa44", "cosigner key algorithm: ed25519, mldsa44, mldsa65, mldsa87")
 	generateLocalCA := flag.Bool("generate-local-ca", false, "generate a self-signed local CA key + cert and exit")
 	flag.Parse()
 
 	// Key generation mode.
 	if *generateKey != "" {
-		pub, err := cosigner.GenerateKey(*generateKey)
+		alg, err := cosigner.ParseAlgorithm(*generateKeyAlg)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
 			os.Exit(1)
 		}
-		fmt.Printf("Generated Ed25519 key pair.\n")
+		var pub []byte
+		if alg == cosigner.AlgEd25519 {
+			pub, err = cosigner.GenerateKey(*generateKey)
+		} else {
+			pub, err = cosigner.GenerateMLDSAKey(*generateKey, alg)
+		}
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("Generated %s key pair.\n", alg.String())
 		fmt.Printf("Public key (hex): %x\n", pub)
 		fmt.Printf("Private key saved to: %s\n", *generateKey)
 		return
@@ -110,28 +125,53 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Connect to CA MariaDB database.
-	caAdapter, err := cadb.New(ctx, cfg.CADB, logger.With("component", "cadb"))
-	if err != nil {
-		logger.Error("failed to connect to CA database", "error", err)
-		os.Exit(1)
+	// Optionally connect to the DigiCert CA MariaDB database. Local-only MTC
+	// deployments append certificate entries directly through the ACME flow.
+	var caAdapter *cadb.Adapter
+	if cfg.CADB.IsEnabled() {
+		caAdapter, err = cadb.New(ctx, cfg.CADB, logger.With("component", "cadb"))
+		if err != nil {
+			logger.Error("failed to connect to CA database", "error", err)
+			os.Exit(1)
+		}
+		defer caAdapter.Close()
+		logger.Info("connected to CA database")
+	} else {
+		logger.Info("CA database disabled; running in local-only issuance mode")
 	}
-	defer caAdapter.Close()
-	logger.Info("connected to CA database")
 
-	// Initialize cosigner.
-	cs, err := cosigner.New(cfg.Cosigner.KeyFile, cfg.Cosigner.KeyID, cfg.Log.Origin)
+	// Initialize cosigners.
+	cs, err := loadPrimaryCosigner(cfg, logger)
 	if err != nil {
 		logger.Error("failed to initialize cosigner", "error", err)
 		os.Exit(1)
 	}
-	// Set the cosigner's TrustAnchorID from the log origin.
-	cs.SetCosignerID([]byte(cfg.Log.Origin))
 	logger.Info("cosigner initialized",
 		"key_id", cs.KeyID(),
 		"origin", cs.Origin(),
+		"algorithm", cs.Algorithm().String(),
+		"cosigner_id", string(cs.CosignerID()),
 		"public_key", cs.PublicKeyHex(),
 	)
+	cosigners := []*cosigner.Cosigner{cs}
+	for _, additional := range cfg.AdditionalCosigners {
+		additionalCS, err := loadAdditionalCosigner(cfg.Log.Origin, additional)
+		if err != nil {
+			logger.Error("failed to initialize additional cosigner",
+				"key_id", additional.KeyID,
+				"algorithm", additional.Algorithm,
+				"error", err,
+			)
+			os.Exit(1)
+		}
+		logger.Info("additional cosigner initialized",
+			"key_id", additionalCS.KeyID(),
+			"algorithm", additionalCS.Algorithm().String(),
+			"cosigner_id", string(additionalCS.CosignerID()),
+			"public_key", additionalCS.PublicKeyHex(),
+		)
+		cosigners = append(cosigners, additionalCS)
+	}
 
 	// Create issuance log.
 	ilog := issuancelog.New(stateStore, cs, cfg.Log.Origin, logger.With("component", "issuancelog"))
@@ -139,20 +179,26 @@ func main() {
 	// Create revocation manager.
 	revMgr := revocation.New(stateStore, logger.With("component", "revocation"))
 
-	// Create watcher.
-	watcherCfg := watcher.Config{
-		PollInterval:           cfg.Watcher.PollInterval,
-		CheckpointInterval:     cfg.Watcher.CheckpointInterval,
-		BatchSize:              cfg.Watcher.BatchSize,
-		RevocationPollInterval: cfg.Watcher.RevocationPollInterval,
-		HousekeepingInterval:   cfg.Watcher.HousekeepingInterval,
-		StaleBundleRetention:   cfg.Watcher.StaleBundleRetention,
-		CheckpointRetention:    cfg.Watcher.CheckpointRetention,
-		CheckpointKeepRecent:   cfg.Watcher.CheckpointKeepRecent,
-		EventRetention:         cfg.Watcher.EventRetention,
-		EventKeepRecent:        cfg.Watcher.EventKeepRecent,
+	// Create watcher only when the DigiCert CA database integration is enabled.
+	var w *watcher.Watcher
+	if caAdapter != nil {
+		watcherCfg := watcher.Config{
+			PollInterval:           cfg.Watcher.PollInterval,
+			CheckpointInterval:     cfg.Watcher.CheckpointInterval,
+			BatchSize:              cfg.Watcher.BatchSize,
+			RevocationPollInterval: cfg.Watcher.RevocationPollInterval,
+			HousekeepingInterval:   cfg.Watcher.HousekeepingInterval,
+			StaleBundleRetention:   cfg.Watcher.StaleBundleRetention,
+			CheckpointRetention:    cfg.Watcher.CheckpointRetention,
+			CheckpointKeepRecent:   cfg.Watcher.CheckpointKeepRecent,
+			EventRetention:         cfg.Watcher.EventRetention,
+			EventKeepRecent:        cfg.Watcher.EventKeepRecent,
+		}
+		w = watcher.New(caAdapter, stateStore, ilog, revMgr, watcherCfg, logger.With("component", "watcher"))
+	} else if err := ilog.Initialize(ctx); err != nil {
+		logger.Error("failed to initialize local issuance log", "error", err)
+		os.Exit(1)
 	}
-	w := watcher.New(caAdapter, stateStore, ilog, revMgr, watcherCfg, logger.With("component", "watcher"))
 
 	// Create assertion issuer and hook into watcher.
 	issuerCfg := assertionissuer.Config{
@@ -169,7 +215,9 @@ func main() {
 		})
 	}
 	issuer := assertionissuer.New(stateStore, cfg.Log.Origin, issuerCfg, logger.With("component", "assertionissuer"))
-	w.OnCheckpoint(issuer.RunOnCheckpoint)
+	if w != nil {
+		w.OnCheckpoint(issuer.RunOnCheckpoint)
+	}
 	logger.Info("assertion issuer configured",
 		"enabled", issuerCfg.Enabled,
 		"batch_size", issuerCfg.BatchSize,
@@ -179,12 +227,14 @@ func main() {
 
 	// Build CA name map for admin visualization.
 	caNameMap := make(map[string]string)
-	for _, ca := range caAdapter.GetCAs() {
-		caNameMap[ca.ID] = ca.Name
+	if caAdapter != nil {
+		for _, ca := range caAdapter.GetCAs() {
+			caNameMap[ca.ID] = ca.Name
+		}
 	}
 
 	// Create HTTP handlers.
-	tlogHandler := tlogtiles.New(stateStore, revMgr, cfg.Log.Origin, logger.With("component", "tlogtiles"))
+	tlogHandler := tlogtiles.New(stateStore, revMgr, cfg.Log.Origin, logger.With("component", "tlogtiles"), cfg.Landmarks.MaxActiveLandmarks)
 	acmeExtURL := ""
 	if cfg.ACME.Enabled {
 		acmeExtURL = cfg.ACME.ExternalURL
@@ -209,6 +259,7 @@ func main() {
 			AssertionPollInterval: cfg.ACME.AssertionPollInterval,
 			AutoApproveChallenge:  cfg.ACME.AutoApproveChallenge,
 			MTCMode:               cfg.LocalCA.MTCMode,
+			MTCProfile:            cfg.LocalCA.MTCProfile,
 		}
 
 		// Optionally initialize local CA for embedded proof issuance.
@@ -231,7 +282,7 @@ func main() {
 			)
 		}
 
-		acmeSrv := acme.New(stateStore, acmeCfg, logger.With("component", "acme"), lca, ilog)
+		acmeSrv := acme.New(stateStore, acmeCfg, logger.With("component", "acme"), lca, ilog, cosigners)
 		acmeServer := &http.Server{
 			Addr:         cfg.ACME.Addr,
 			Handler:      acmeSrv,
@@ -275,8 +326,38 @@ func main() {
 	mux.Handle("/proof/", tlogHandler)
 	mux.Handle("/assertion/", tlogHandler)
 	mux.Handle("/assertions/", tlogHandler)
+	mux.Handle("/landmarks", tlogHandler)
+	mux.Handle("/landmarks.txt", tlogHandler)
+	mux.Handle("/landmark/", tlogHandler)
+	mux.Handle("/trusted-subtrees", tlogHandler)
 	mux.Handle("/admin", adminHandler)
 	mux.Handle("/admin/", adminHandler)
+	mux.HandleFunc("GET /cosigners", func(w http.ResponseWriter, r *http.Request) {
+		type cosignerJSON struct {
+			CosignerID string `json:"cosigner_id"`
+			KeyID      string `json:"key_id"`
+			Algorithm  string `json:"algorithm"`
+			PublicKey  string `json:"public_key"`
+		}
+		result := struct {
+			LogID     string         `json:"log_id"`
+			Cosigners []cosignerJSON `json:"cosigners"`
+		}{
+			LogID: cfg.ACME.MTCBridgeURL,
+		}
+		for _, cs := range cosigners {
+			result.Cosigners = append(result.Cosigners, cosignerJSON{
+				CosignerID: string(cs.CosignerID()),
+				KeyID:      cs.KeyID(),
+				Algorithm:  cs.Algorithm().String(),
+				PublicKey:  hex.EncodeToString(cs.PublicKeyBytes()),
+			})
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(result); err != nil {
+			logger.Warn("encode cosigner trust material failed", "error", err)
+		}
+	})
 
 	// Health check endpoint.
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -293,12 +374,23 @@ func main() {
 		BaseContext:  func(_ net.Listener) context.Context { return ctx },
 	}
 
-	// Start watcher in background.
-	go func() {
-		if err := w.Run(ctx); err != nil && ctx.Err() == nil {
-			logger.Error("watcher error", "error", err)
-		}
-	}()
+	// Start watcher in background when DigiCert CA DB polling is enabled.
+	if w != nil {
+		go func() {
+			if err := w.Run(ctx); err != nil && ctx.Err() == nil {
+				logger.Error("watcher error", "error", err)
+			}
+		}()
+	}
+
+	if cfg.Landmarks.Enabled {
+		allocator := landmark.NewAllocator(stateStore, cfg.Landmarks.Interval, logger.With("component", "landmarks"))
+		go allocator.Run(ctx)
+		logger.Info("landmark allocator started",
+			"interval", cfg.Landmarks.Interval.String(),
+			"max_active_landmarks", cfg.Landmarks.MaxActiveLandmarks,
+		)
+	}
 
 	// Start HTTP server in background.
 	go func() {
@@ -321,4 +413,63 @@ func main() {
 	}
 
 	logger.Info("mtc-bridge stopped")
+}
+
+func loadPrimaryCosigner(cfg *config.Config, logger *slog.Logger) (*cosigner.Cosigner, error) {
+	alg, err := cosigner.ParseAlgorithm(cfg.Cosigner.Algorithm)
+	if err != nil {
+		return nil, err
+	}
+
+	var cs *cosigner.Cosigner
+	switch alg {
+	case cosigner.AlgEd25519:
+		cs, err = cosigner.New(cfg.Cosigner.KeyFile, cfg.Cosigner.KeyID, cfg.Log.Origin)
+	default:
+		cs, err = cosigner.NewMLDSA(cfg.Cosigner.KeyFile, alg, cfg.Cosigner.KeyID, cfg.Log.Origin, primaryCosignerID(cfg))
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	if alg == cosigner.AlgEd25519 {
+		cs.SetCosignerID(primaryCosignerID(cfg))
+	}
+	if len(cs.CosignerID()) == 0 {
+		logger.Warn("primary cosigner ID is empty; using log origin", "origin", cfg.Log.Origin)
+		cs.SetCosignerID([]byte(cfg.Log.Origin))
+	}
+	return cs, nil
+}
+
+func primaryCosignerID(cfg *config.Config) []byte {
+	if cfg.Cosigner.CosignerID != 0 {
+		return []byte(strconv.FormatUint(uint64(cfg.Cosigner.CosignerID), 10))
+	}
+	return []byte(cfg.Log.Origin)
+}
+
+func loadAdditionalCosigner(origin string, cfg config.AdditionalCosignerConfig) (*cosigner.Cosigner, error) {
+	alg, err := cosigner.ParseAlgorithm(cfg.Algorithm)
+	if err != nil {
+		return nil, err
+	}
+	id := []byte(cfg.CosignerID)
+	if len(id) == 0 {
+		id = []byte(cfg.KeyID)
+	}
+	if len(id) == 0 {
+		return nil, fmt.Errorf("additional cosigner requires cosigner_id or key_id")
+	}
+	switch alg {
+	case cosigner.AlgEd25519:
+		cs, err := cosigner.New(cfg.KeyFile, cfg.KeyID, origin)
+		if err != nil {
+			return nil, err
+		}
+		cs.SetCosignerID(id)
+		return cs, nil
+	default:
+		return cosigner.NewMLDSA(cfg.KeyFile, alg, cfg.KeyID, origin, id)
+	}
 }
