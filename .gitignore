@@ -40,3 +40,13 @@ mtc-conformance
 mtc-tls-server
 mtc-tls-verify
 mtc-verify-cert
+
+# Local demo / ACME artifacts
+testcerts/
+acme-keys/
+*.crt
+*.csr
+*.der
+*.p12
+*.pfx
+*.srl

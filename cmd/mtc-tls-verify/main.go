@@ -32,6 +32,7 @@ import (
 	"time"
 
 	"github.com/briantrzupek/ca-extension-merkle/internal/assertion"
+	"github.com/briantrzupek/ca-extension-merkle/internal/merkle"
 	"github.com/briantrzupek/ca-extension-merkle/internal/mtccert"
 )
 
@@ -148,25 +149,62 @@ func verifyMTCCert(certDER []byte, host string) {
 		detail: fmt.Sprintf("subtree [%d, %d), %d hashes", parsed.Proof.Start, parsed.Proof.End, len(parsed.Proof.InclusionProof)),
 	})
 
-	// Check 3: Verify inclusion proof.
-	result, verErr := mtccert.VerifyMTCCert(certDER, mtccert.VerifyOptions{})
+	opts := mtccert.VerifyOptions{}
+	if *bridgeURL != "" {
+		trust, err := fetchCosignerTrust(*bridgeURL)
+		if err != nil {
+			results = append(results, checkResult{
+				name:   "Trusted cosigner keys loaded",
+				passed: false,
+				detail: err.Error(),
+			})
+		} else {
+			opts.LogID = []byte(trust.LogID)
+			opts.CosignerKeys = trust.CosignerKeys
+			results = append(results, checkResult{
+				name:   "Trusted cosigner keys loaded",
+				passed: true,
+				detail: fmt.Sprintf("%d key(s)", len(opts.CosignerKeys)),
+			})
+		}
+
+		subtrees, err := fetchTrustedSubtrees(*bridgeURL)
+		if err != nil {
+			results = append(results, checkResult{
+				name:   "Trusted landmark subtrees loaded",
+				passed: false,
+				detail: err.Error(),
+			})
+		} else {
+			opts.TrustedSubtrees = subtrees
+			results = append(results, checkResult{
+				name:   "Trusted landmark subtrees loaded",
+				passed: true,
+				detail: fmt.Sprintf("%d subtree(s)", len(opts.TrustedSubtrees)),
+			})
+		}
+	}
+
+	// Check 3: Verify the MTC proof against trusted cosigner signatures or
+	// landmark subtrees, depending on the proof mode.
+	result, verErr := mtccert.VerifyMTCCert(certDER, opts)
 	if verErr != nil {
 		results = append(results, checkResult{
-			name:   "Merkle inclusion proof valid",
+			name:   "MTC proof verified",
 			passed: false,
 			detail: verErr.Error(),
 		})
 	} else if result.ProofValid {
 		results = append(results, checkResult{
-			name:   "Merkle inclusion proof valid",
+			name:   "MTC proof verified",
 			passed: true,
 			detail: fmt.Sprintf("leaf %d in subtree [%d, %d)", result.LeafIndex, result.SubtreeStart, result.SubtreeEnd),
 		})
 	} else {
 		results = append(results, checkResult{
-			name:   "Merkle inclusion proof valid",
+			name:   "MTC proof verified",
 			passed: false,
-			detail: "proof verification returned false",
+			detail: "no trusted cosigner signature or landmark subtree verified",
 		})
 	}
 
@@ -181,9 +219,101 @@ func verifyMTCCert(certDER []byte, host string) {
 			passed: true,
 			detail: mode,
 		})
+		if len(parsed.Proof.Signatures) > 0 {
+			results = append(results, checkResult{
+				name:   "Trusted cosigner signature verified",
+				passed: result.SignaturesVerified > 0,
+				detail: fmt.Sprintf("%d verified", result.SignaturesVerified),
+			})
+		} else {
+			results = append(results, checkResult{
+				name:   "Trusted landmark subtree verified",
+				passed: result.ProofValid,
+			})
+		}
 	}
 
 	printResults(results)
+}
+
+type cosignerTrust struct {
+	LogID        string
+	CosignerKeys map[string]mtccert.CosignerKey
+}
+
+func fetchCosignerTrust(bridgeBase string) (*cosignerTrust, error) {
+	url := strings.TrimRight(bridgeBase, "/") + "/cosigners"
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Get(url)
+	if err != nil {
+		return nil, fmt.Errorf("GET /cosigners: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("bridge returned HTTP %d for /cosigners", resp.StatusCode)
+	}
+
+	var body struct {
+		LogID     string `json:"log_id"`
+		Cosigners []struct {
+			CosignerID string `json:"cosigner_id"`
+			Algorithm  string `json:"algorithm"`
+			PublicKey  string `json:"public_key"`
+		} `json:"cosigners"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		return nil, fmt.Errorf("decode /cosigners: %w", err)
+	}
+
+	keys := make(map[string]mtccert.CosignerKey)
+	for _, c := range body.Cosigners {
+		pub, err := hex.DecodeString(c.PublicKey)
+		if err != nil {
+			return nil, fmt.Errorf("decode public key for %q: %w", c.CosignerID, err)
+		}
+		keys[c.CosignerID] = mtccert.CosignerKey{
+			Algorithm: c.Algorithm,
+			PublicKey: pub,
+		}
+	}
+	return &cosignerTrust{LogID: body.LogID, CosignerKeys: keys}, nil
+}
+
+func fetchTrustedSubtrees(bridgeBase string) ([]mtccert.TrustedSubtree, error) {
+	url := strings.TrimRight(bridgeBase, "/") + "/trusted-subtrees"
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Get(url)
+	if err != nil {
+		return nil, fmt.Errorf("GET /trusted-subtrees: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("bridge returned HTTP %d for /trusted-subtrees", resp.StatusCode)
+	}
+
+	var body []struct {
+		Start    int64  `json:"start"`
+		End      int64  `json:"end"`
+		RootHash string `json:"root_hash"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		return nil, fmt.Errorf("decode /trusted-subtrees: %w", err)
+	}
+
+	subtrees := make([]mtccert.TrustedSubtree, 0, len(body))
+	for _, st := range body {
+		rootBytes, err := hex.DecodeString(st.RootHash)
+		if err != nil {
+			return nil, fmt.Errorf("decode trusted subtree [%d,%d): %w", st.Start, st.End, err)
+		}
+		if len(rootBytes) != merkle.HashSize {
+			return nil, fmt.Errorf("trusted subtree [%d,%d) root has %d bytes", st.Start, st.End, len(rootBytes))
+		}
+		var root merkle.Hash
+		copy(root[:], rootBytes)
+		subtrees = append(subtrees, mtccert.TrustedSubtree{Start: st.Start, End: st.End, Root: root})
+	}
+	return subtrees, nil
 }
 
 func verifyLegacyCert(leaf *x509.Certificate, state tls.ConnectionState, host string) {

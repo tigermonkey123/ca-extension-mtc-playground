@@ -53,8 +53,8 @@ func main() {
 	output := flag.String("output", "", "output PEM file path (default: stdout)")
 	mtcMode := flag.Bool("mtc-mode", false, "generate MTC-spec cert (id-alg-mtcProof) instead of legacy X.509 extension")
 	normalX509 := flag.Bool("normal-x509", false, "generate a normal X.509 CA-signed certificate instead of an MTC demo certificate")
-	keyAlg := flag.String("key-alg", "ec", "subject public key algorithm for MTC mode: ec, ML-DSA-44, ML-DSA-65, ML-DSA-87, or SLH-DSA-*")
-	x509SigAlg := flag.String("x509-sig-alg", "ec", "normal X.509 signing/key algorithm: ec, ML-DSA-44, ML-DSA-65, ML-DSA-87, or SLH-DSA-*")
+	keyAlg := flag.String("key-alg", "ML-DSA-44", "subject public key algorithm for MTC mode: ec, ML-DSA-44, ML-DSA-65, ML-DSA-87, or SLH-DSA-*")
+	x509SigAlg := flag.String("x509-sig-alg", "ML-DSA-44", "normal X.509 signing/key algorithm: ec, ML-DSA-44, ML-DSA-65, ML-DSA-87, or SLH-DSA-*")
 	flag.Parse()
 
 	if *mtcMode && *normalX509 {

@@ -128,7 +128,7 @@ func VerifyMTCCert(certDER []byte, opts VerifyOptions) (*VerifyResult, error) {
 		LeafIndex:    parsed.SerialNumber,
 		SubtreeStart: proof.Start,
 		SubtreeEnd:   proof.End,
-		ProofValid:   proofValid,
+		ProofValid:   false,
 	}
 
 	// Step 6: Determine mode and verify accordingly.

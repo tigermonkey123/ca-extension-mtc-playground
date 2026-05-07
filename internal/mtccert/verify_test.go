@@ -129,6 +129,30 @@ func TestVerifyMTCCertSignaturelessLandmarkMismatchFails(t *testing.T) {
 	}
 }
 
+func TestVerifyMTCCertSignaturelessWithoutTrustedSubtreeFails(t *testing.T) {
+	csr := testCSR(t)
+	notBefore := time.Now().UTC().Truncate(time.Second)
+	notAfter := notBefore.Add(time.Hour)
+	_, proofHashes := testLogTree(t, csr, "test-log", notBefore, notAfter)
+	proof := &mtcformat.MTCProof{
+		Start:          0,
+		End:            2,
+		InclusionProof: hashesToBytes(proofHashes),
+	}
+	certDER, err := BuildMTCCertFromCSR(csr, "test-log", notBefore, notAfter, []string{"test.example.com"}, 0, proof)
+	if err != nil {
+		t.Fatalf("BuildMTCCertFromCSR: %v", err)
+	}
+
+	result, err := VerifyMTCCert(certDER, VerifyOptions{})
+	if err != nil {
+		t.Fatalf("VerifyMTCCert: %v", err)
+	}
+	if result.ProofValid {
+		t.Fatal("ProofValid = true, want false without trusted landmark material")
+	}
+}
+
 func TestVerifyMTCCertSignaturelessTrustedSubtree(t *testing.T) {
 	csr := testCSR(t)
 	logID := "test-log"
