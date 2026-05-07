@@ -56,6 +56,9 @@ type Config struct {
 
 	// LocalCA configures the optional local intermediate CA for embedded proof issuance.
 	LocalCA LocalCAConfig `yaml:"local_ca"`
+
+	// Landmarks configures automatic landmark allocation.
+	Landmarks LandmarkConfig `yaml:"landmarks"`
 }
 
 // ACMEConfig configures the ACME server.
@@ -119,6 +122,20 @@ type AssertionIssuerConfig struct {
 
 	// Webhooks is a list of webhook targets to notify after assertion generation.
 	Webhooks []WebhookConfig `yaml:"webhooks"`
+}
+
+// LandmarkConfig configures automatic landmark allocation and publication.
+type LandmarkConfig struct {
+	// Enabled turns automatic landmark allocation on/off.
+	Enabled bool `yaml:"enabled"`
+
+	// Interval is how often the latest checkpoint should be designated as a
+	// landmark when the tree has advanced.
+	Interval time.Duration `yaml:"interval"`
+
+	// MaxActiveLandmarks limits publication to the most recent N landmarks. A
+	// zero value publishes all landmarks.
+	MaxActiveLandmarks int `yaml:"max_active_landmarks"`
 }
 
 // IsEnabled returns whether the assertion issuer is enabled.
@@ -308,7 +325,7 @@ type CosignerConfig struct {
 	KeyID string `yaml:"key_id"`
 
 	// Algorithm is the signature algorithm: "ed25519", "mldsa44", "mldsa65", "mldsa87".
-	// Default: "ed25519".
+	// Default: "mldsa44".
 	Algorithm string `yaml:"algorithm"`
 
 	// CosignerID is the numeric identifier for MTCSignature (default: 0).
@@ -465,6 +482,9 @@ func applyDefaults(cfg *Config) {
 	if cfg.Cosigner.KeyID == "" {
 		cfg.Cosigner.KeyID = "mtc-bridge-cosigner"
 	}
+	if cfg.Cosigner.Algorithm == "" {
+		cfg.Cosigner.Algorithm = "mldsa44"
+	}
 
 	if cfg.Logging.Level == "" {
 		cfg.Logging.Level = "info"
@@ -482,6 +502,9 @@ func applyDefaults(cfg *Config) {
 	}
 	if cfg.AssertionIssuer.StalenessThreshold <= 0 {
 		cfg.AssertionIssuer.StalenessThreshold = 5
+	}
+	if cfg.Landmarks.Interval <= 0 {
+		cfg.Landmarks.Interval = time.Hour
 	}
 
 	// ACME defaults.
@@ -545,6 +568,14 @@ func (c *Config) Validate() error {
 	if c.Cosigner.KeyFile == "" {
 		errs = append(errs, "cosigner.key_file is required")
 	}
+	if _, err := cosignerAlgorithm(c.Cosigner.Algorithm); err != nil {
+		errs = append(errs, "cosigner.algorithm must be ed25519, mldsa44, mldsa65, or mldsa87")
+	}
+	for i, additional := range c.AdditionalCosigners {
+		if _, err := cosignerAlgorithm(additional.Algorithm); err != nil {
+			errs = append(errs, fmt.Sprintf("additional_cosigners[%d].algorithm must be ed25519, mldsa44, mldsa65, or mldsa87", i))
+		}
+	}
 	switch strings.ToLower(c.LocalCA.MTCProfile) {
 	case "", "signatureless", "standalone":
 	default:
@@ -555,6 +586,15 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("config.Validate: %s", strings.Join(errs, "; "))
 	}
 	return nil
+}
+
+func cosignerAlgorithm(alg string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(alg)) {
+	case "", "ed25519", "mldsa44", "ml-dsa-44", "mldsa65", "ml-dsa-65", "mldsa87", "ml-dsa-87":
+		return alg, nil
+	default:
+		return "", fmt.Errorf("unknown cosigner algorithm %q", alg)
+	}
 }
 
 // String returns a redacted summary for logging.

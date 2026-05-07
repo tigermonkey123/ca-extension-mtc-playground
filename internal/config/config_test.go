@@ -58,6 +58,9 @@ func TestApplyDefaults(t *testing.T) {
 	if cfg.HTTP.Addr != ":8080" {
 		t.Errorf("default http addr = %q, want %q", cfg.HTTP.Addr, ":8080")
 	}
+	if cfg.Cosigner.Algorithm != "mldsa44" {
+		t.Errorf("default cosigner algorithm = %q, want %q", cfg.Cosigner.Algorithm, "mldsa44")
+	}
 }
 
 func TestPostgresDSN(t *testing.T) {

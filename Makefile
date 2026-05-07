@@ -17,7 +17,7 @@ help:
 	@echo "  vet              Run go vet"
 	@echo "  clean            Remove build artifacts"
 	@echo "  run              Run mtc-bridge locally"
-	@echo "  generate-key     Generate a new Ed25519 signing key"
+	@echo "  generate-key     Generate a new ML-DSA-44 signing key"
 	@echo "  generate-local-ca Generate a self-signed local CA key + cert for embedded proofs"
 	@echo "  conformance      Run conformance test suite against a running server"
 	@echo "  interop          Cross-validate against bwesterb/mtc reference implementation"
@@ -62,7 +62,7 @@ run: build
 # Generate signing key
 generate-key: build
 	@mkdir -p keys
-	./bin/mtc-bridge -generate-key keys/cosigner.key
+	./bin/mtc-bridge -generate-key keys/cosigner-mldsa44.key -generate-key-alg mldsa44
 
 # Generate local CA key + cert for embedded proof mode
 generate-local-ca: build

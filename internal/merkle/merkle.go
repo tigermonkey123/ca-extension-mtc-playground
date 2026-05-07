@@ -347,6 +347,18 @@ func InclusionProofFromNodes(index, size int64, nodeAt func(level int, idx int64
 	return inclusionProofFromNodes(index, 0, size, 0, nodeAt), nil
 }
 
+// InclusionProofFromNodesForRange computes an inclusion proof for a leaf within
+// an arbitrary subtree range [start, end).
+func InclusionProofFromNodesForRange(index, start, end int64, nodeAt func(level int, idx int64) Hash) ([]Hash, error) {
+	if start < 0 || end <= start {
+		return nil, fmt.Errorf("merkle.InclusionProofFromNodesForRange: invalid range [%d, %d)", start, end)
+	}
+	if index < start || index >= end {
+		return nil, fmt.Errorf("merkle.InclusionProofFromNodesForRange: index %d out of range [%d, %d)", index, start, end)
+	}
+	return inclusionProofFromNodes(index, start, end, 0, nodeAt), nil
+}
+
 func inclusionProofFromNodes(index, start, end int64, level int, nodeAt func(int, int64) Hash) []Hash {
 	n := end - start
 	if n == 1 {
@@ -482,6 +494,15 @@ func RootFromNodes(size int64, nodeAt func(level int, idx int64) Hash) Hash {
 	return subtreeHashFromNodes(0, size, 0, nodeAt)
 }
 
+// SubtreeHashFromNodes computes the Merkle hash for an arbitrary subtree range
+// [start, end) from stored tree nodes.
+func SubtreeHashFromNodes(start, end int64, nodeAt func(level int, idx int64) Hash) Hash {
+	if end <= start {
+		return sha256.Sum256(nil)
+	}
+	return subtreeHashFromNodes(start, end, 0, nodeAt)
+}
+
 // subtreeHashFromNodes computes the Merkle hash for [start, end) at the given
 // base level using precomputed nodes. For complete power-of-two subtrees, it
 // reads a single stored node. For right-edge partial subtrees, it recurses.
@@ -490,8 +511,9 @@ func subtreeHashFromNodes(start, end int64, level int, nodeAt func(int, int64) H
 	if n == 1 {
 		return nodeAt(level, start)
 	}
-	// If n is a power of 2, the subtree hash is stored at a higher level.
-	if n&(n-1) == 0 {
+	// If n is a power of 2 and the range is aligned, the subtree hash is
+	// stored at a higher level.
+	if n&(n-1) == 0 && start%n == 0 {
 		// n = 2^h leaves → stored at level+h.
 		h := bits.TrailingZeros64(uint64(n))
 		storageIdx := start >> uint(h)

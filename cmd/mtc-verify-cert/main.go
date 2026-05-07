@@ -31,6 +31,7 @@ import (
 	"time"
 
 	"github.com/briantrzupek/ca-extension-merkle/internal/localca"
+	"github.com/briantrzupek/ca-extension-merkle/internal/merkle"
 	"github.com/briantrzupek/ca-extension-merkle/internal/mtccert"
 )
 
@@ -116,6 +117,13 @@ func verifyMTCFormat(certDER []byte) {
 			opts.CosignerKeys = trust.CosignerKeys
 			fmt.Printf("[INFO] Loaded %d trusted cosigner keys from bridge\n", len(opts.CosignerKeys))
 		}
+		subtrees, err := fetchTrustedSubtrees()
+		if err != nil {
+			fmt.Printf("[WARN] Could not fetch trusted subtrees: %v\n", err)
+		} else {
+			opts.TrustedSubtrees = subtrees
+			fmt.Printf("[INFO] Loaded %d trusted landmark subtree(s) from bridge\n", len(opts.TrustedSubtrees))
+		}
 	}
 
 	// Verify the inclusion proof and, for signed standalone proofs, trusted
@@ -192,6 +200,43 @@ func fetchCosignerTrust() (*cosignerTrust, error) {
 		}
 	}
 	return &cosignerTrust{LogID: body.LogID, CosignerKeys: keys}, nil
+}
+
+func fetchTrustedSubtrees() ([]mtccert.TrustedSubtree, error) {
+	url := strings.TrimRight(*bridgeURL, "/") + "/trusted-subtrees"
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Get(url)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("bridge returned %d for /trusted-subtrees", resp.StatusCode)
+	}
+
+	var body []struct {
+		Start    int64  `json:"start"`
+		End      int64  `json:"end"`
+		RootHash string `json:"root_hash"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		return nil, err
+	}
+
+	subtrees := make([]mtccert.TrustedSubtree, 0, len(body))
+	for _, st := range body {
+		rootBytes, err := hex.DecodeString(st.RootHash)
+		if err != nil {
+			return nil, fmt.Errorf("decode trusted subtree [%d,%d): %w", st.Start, st.End, err)
+		}
+		if len(rootBytes) != merkle.HashSize {
+			return nil, fmt.Errorf("trusted subtree [%d,%d) root has %d bytes", st.Start, st.End, len(rootBytes))
+		}
+		var root merkle.Hash
+		copy(root[:], rootBytes)
+		subtrees = append(subtrees, mtccert.TrustedSubtree{Start: st.Start, End: st.End, Root: root})
+	}
+	return subtrees, nil
 }
 
 func verifyMTCCheckpoint(parsed *mtccert.ParsedMTCCert) {

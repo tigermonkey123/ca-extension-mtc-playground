@@ -94,6 +94,8 @@ func New(s *store.Store, cfg Config, logger *slog.Logger, lca *localca.LocalCA, 
 	srv.mux.HandleFunc("POST /acme/authz/{id}", srv.handleAuthorization)
 	srv.mux.HandleFunc("POST /acme/challenge/{id}", srv.handleChallenge)
 	srv.mux.HandleFunc("POST /acme/certificate/{id}", srv.handleCertificate)
+	srv.mux.HandleFunc("POST /acme/certificate/{id}/landmark", srv.handleLandmarkCertificate)
+	srv.mux.HandleFunc("GET /acme/certificate/{id}/landmark", srv.handleLandmarkCertificate)
 	go srv.cleanupNonces()
 	return srv
 }

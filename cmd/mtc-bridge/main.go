@@ -34,6 +34,7 @@ import (
 	"github.com/briantrzupek/ca-extension-merkle/internal/config"
 	"github.com/briantrzupek/ca-extension-merkle/internal/cosigner"
 	"github.com/briantrzupek/ca-extension-merkle/internal/issuancelog"
+	"github.com/briantrzupek/ca-extension-merkle/internal/landmark"
 	"github.com/briantrzupek/ca-extension-merkle/internal/localca"
 	"github.com/briantrzupek/ca-extension-merkle/internal/revocation"
 	"github.com/briantrzupek/ca-extension-merkle/internal/store"
@@ -43,18 +44,29 @@ import (
 
 func main() {
 	configFile := flag.String("config", "config.yaml", "path to configuration file")
-	generateKey := flag.String("generate-key", "", "generate a new Ed25519 key and exit")
+	generateKey := flag.String("generate-key", "", "generate a new cosigner key and exit")
+	generateKeyAlg := flag.String("generate-key-alg", "mldsa44", "cosigner key algorithm: ed25519, mldsa44, mldsa65, mldsa87")
 	generateLocalCA := flag.Bool("generate-local-ca", false, "generate a self-signed local CA key + cert and exit")
 	flag.Parse()
 
 	// Key generation mode.
 	if *generateKey != "" {
-		pub, err := cosigner.GenerateKey(*generateKey)
+		alg, err := cosigner.ParseAlgorithm(*generateKeyAlg)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
 			os.Exit(1)
 		}
-		fmt.Printf("Generated Ed25519 key pair.\n")
+		var pub []byte
+		if alg == cosigner.AlgEd25519 {
+			pub, err = cosigner.GenerateKey(*generateKey)
+		} else {
+			pub, err = cosigner.GenerateMLDSAKey(*generateKey, alg)
+		}
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("Generated %s key pair.\n", alg.String())
 		fmt.Printf("Public key (hex): %x\n", pub)
 		fmt.Printf("Private key saved to: %s\n", *generateKey)
 		return
@@ -222,7 +234,7 @@ func main() {
 	}
 
 	// Create HTTP handlers.
-	tlogHandler := tlogtiles.New(stateStore, revMgr, cfg.Log.Origin, logger.With("component", "tlogtiles"))
+	tlogHandler := tlogtiles.New(stateStore, revMgr, cfg.Log.Origin, logger.With("component", "tlogtiles"), cfg.Landmarks.MaxActiveLandmarks)
 	acmeExtURL := ""
 	if cfg.ACME.Enabled {
 		acmeExtURL = cfg.ACME.ExternalURL
@@ -314,6 +326,10 @@ func main() {
 	mux.Handle("/proof/", tlogHandler)
 	mux.Handle("/assertion/", tlogHandler)
 	mux.Handle("/assertions/", tlogHandler)
+	mux.Handle("/landmarks", tlogHandler)
+	mux.Handle("/landmarks.txt", tlogHandler)
+	mux.Handle("/landmark/", tlogHandler)
+	mux.Handle("/trusted-subtrees", tlogHandler)
 	mux.Handle("/admin", adminHandler)
 	mux.Handle("/admin/", adminHandler)
 	mux.HandleFunc("GET /cosigners", func(w http.ResponseWriter, r *http.Request) {
@@ -365,6 +381,15 @@ func main() {
 				logger.Error("watcher error", "error", err)
 			}
 		}()
+	}
+
+	if cfg.Landmarks.Enabled {
+		allocator := landmark.NewAllocator(stateStore, cfg.Landmarks.Interval, logger.With("component", "landmarks"))
+		go allocator.Run(ctx)
+		logger.Info("landmark allocator started",
+			"interval", cfg.Landmarks.Interval.String(),
+			"max_active_landmarks", cfg.Landmarks.MaxActiveLandmarks,
+		)
 	}
 
 	// Start HTTP server in background.

@@ -27,6 +27,13 @@ type CosignerKey struct {
 	PublicKey []byte
 }
 
+// TrustedSubtree is a trusted landmark subtree root for signatureless mode.
+type TrustedSubtree struct {
+	Start int64
+	End   int64
+	Root  merkle.Hash
+}
+
 // VerifyOptions configures how MTC certificate verification works.
 type VerifyOptions struct {
 	// CosignerKeys maps cosigner TrustAnchorID (ASCII or hex-encoded) to
@@ -34,7 +41,12 @@ type VerifyOptions struct {
 	CosignerKeys map[string]CosignerKey
 
 	// Landmarks maps tree_size → root hash for signatureless mode verification.
+	// Deprecated: use TrustedSubtrees for arbitrary landmark-relative ranges.
 	Landmarks map[int64]merkle.Hash
+
+	// TrustedSubtrees maps arbitrary [start, end) landmark subtree ranges to
+	// root hashes for signatureless mode verification.
+	TrustedSubtrees []TrustedSubtree
 
 	// LogID is the log identifier for subtree signature verification.
 	LogID []byte
@@ -136,10 +148,18 @@ func VerifyMTCCert(certDER []byte, opts VerifyOptions) (*VerifyResult, error) {
 		}
 	} else {
 		result.Mode = "signatureless"
-		// In signatureless mode, verify the subtree root against a known landmark.
+		// In signatureless mode, verify the subtree root against a trusted
+		// landmark subtree.
+		for _, trusted := range opts.TrustedSubtrees {
+			if trusted.Start == int64(proof.Start) && trusted.End == int64(proof.End) {
+				result.ProofValid = proofValid && subtreeRoot == trusted.Root
+				return result, nil
+			}
+		}
+		// Backward-compatible [0, tree_size) landmark verification.
 		if opts.Landmarks != nil {
 			if expectedRoot, ok := opts.Landmarks[int64(proof.End)]; ok {
-				result.ProofValid = proofValid && subtreeRoot == expectedRoot
+				result.ProofValid = proof.Start == 0 && proofValid && subtreeRoot == expectedRoot
 			}
 		}
 	}

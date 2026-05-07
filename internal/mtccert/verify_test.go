@@ -129,6 +129,67 @@ func TestVerifyMTCCertSignaturelessLandmarkMismatchFails(t *testing.T) {
 	}
 }
 
+func TestVerifyMTCCertSignaturelessTrustedSubtree(t *testing.T) {
+	csr := testCSR(t)
+	logID := "test-log"
+	notBefore := time.Now().UTC().Truncate(time.Second)
+	notAfter := notBefore.Add(time.Hour)
+
+	logEntryDER, err := mtcformat.BuildLogEntryFromCSR(logID, notBefore, notAfter, csr, []string{"test.example.com"})
+	if err != nil {
+		t.Fatalf("BuildLogEntryFromCSR: %v", err)
+	}
+	contentsOctets, err := mtcformat.DERContentsOctets(logEntryDER)
+	if err != nil {
+		t.Fatalf("DERContentsOctets: %v", err)
+	}
+	certEntry, err := mtcformat.MarshalEntry(&mtcformat.MerkleTreeCertEntry{Type: mtcformat.EntryTypeTBSCert, Data: contentsOctets})
+	if err != nil {
+		t.Fatalf("MarshalEntry cert: %v", err)
+	}
+	nullEntry, err := mtcformat.MarshalEntry(&mtcformat.MerkleTreeCertEntry{Type: mtcformat.EntryTypeNull})
+	if err != nil {
+		t.Fatalf("MarshalEntry null: %v", err)
+	}
+
+	leaves := [][]byte{nullEntry, certEntry, nullEntry}
+	leafHashes := make([]merkle.Hash, len(leaves))
+	for i, leaf := range leaves {
+		leafHashes[i] = merkle.LeafHash(leaf)
+	}
+	hashAt := func(idx int64) merkle.Hash { return leafHashes[idx] }
+	proofHashes, err := merkle.InclusionProof(0, 2, func(idx int64) merkle.Hash {
+		return hashAt(idx + 1)
+	})
+	if err != nil {
+		t.Fatalf("InclusionProof: %v", err)
+	}
+	trustedRoot := merkle.SubtreeHash(1, 3, hashAt)
+	proof := &mtcformat.MTCProof{
+		Start:          1,
+		End:            3,
+		InclusionProof: hashesToBytes(proofHashes),
+	}
+	certDER, err := BuildMTCCertFromCSR(csr, logID, notBefore, notAfter, []string{"test.example.com"}, 1, proof)
+	if err != nil {
+		t.Fatalf("BuildMTCCertFromCSR: %v", err)
+	}
+
+	result, err := VerifyMTCCert(certDER, VerifyOptions{
+		TrustedSubtrees: []TrustedSubtree{{Start: 1, End: 3, Root: trustedRoot}},
+		LogID:           []byte(logID),
+	})
+	if err != nil {
+		t.Fatalf("VerifyMTCCert: %v", err)
+	}
+	if !result.ProofValid {
+		t.Fatal("ProofValid = false, want true")
+	}
+	if result.Mode != "signatureless" {
+		t.Fatalf("Mode = %q, want signatureless", result.Mode)
+	}
+}
+
 type testSigner func(t *testing.T, input []byte) (mtcformat.MTCSignature, CosignerKey)
 
 func buildSignedTestCert(t *testing.T, signer testSigner, mutators ...func(*mtcformat.MTCProof)) ([]byte, VerifyOptions) {

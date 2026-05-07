@@ -47,8 +47,9 @@ watcher:
   batch_size: 500
 
 cosigner:
-  key_file: "${MTC_COSIGNER_KEY_FILE:-keys/cosigner.key}"
+  key_file: "${MTC_COSIGNER_KEY_FILE:-keys/cosigner-mldsa44.key}"
   key_id: "mtc-bridge-dev"
+  algorithm: "mldsa44"
 
 logging:
   level: "info"
@@ -63,6 +64,11 @@ assertion_issuer:
   #   - url: "https://example.com/mtc-webhook"
   #     pattern: "*.example.com"
   #     secret: "webhook-secret"
+
+landmarks:
+  enabled: true
+  interval: 1m
+  max_active_landmarks: 0  # 0 = publish all landmarks
 
 local_ca:
   enabled: true
