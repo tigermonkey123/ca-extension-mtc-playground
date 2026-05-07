@@ -29,11 +29,11 @@ import (
 )
 
 var (
-	oidSubjectAltName        = asn1.ObjectIdentifier{2, 5, 29, 17}
-	oidKeyUsage              = asn1.ObjectIdentifier{2, 5, 29, 15}
-	oidExtKeyUsage           = asn1.ObjectIdentifier{2, 5, 29, 37}
-	oidBasicConstraints      = asn1.ObjectIdentifier{2, 5, 29, 19}
-	oidSubjectKeyIdentifier  = asn1.ObjectIdentifier{2, 5, 29, 14}
+	oidSubjectAltName         = asn1.ObjectIdentifier{2, 5, 29, 17}
+	oidKeyUsage               = asn1.ObjectIdentifier{2, 5, 29, 15}
+	oidExtKeyUsage            = asn1.ObjectIdentifier{2, 5, 29, 37}
+	oidBasicConstraints       = asn1.ObjectIdentifier{2, 5, 29, 19}
+	oidSubjectKeyIdentifier   = asn1.ObjectIdentifier{2, 5, 29, 14}
 	oidAuthorityKeyIdentifier = asn1.ObjectIdentifier{2, 5, 29, 35}
 )
 
@@ -45,6 +45,14 @@ type DemoChain struct {
 	CAPEM     []byte
 	CADER     []byte
 	KeyPEM    []byte
+}
+
+// DemoKeyMaterial is a freshly generated demo key encoded for certificate
+// builders that need raw SubjectPublicKeyInfo DER.
+type DemoKeyMaterial struct {
+	Algorithm            string
+	SubjectPublicKeyInfo []byte
+	KeyPEM               []byte
 }
 
 type algorithmIdentifier struct {
@@ -90,6 +98,57 @@ func GenerateDemoChain(alg, domain string, validityDuration time.Duration) (*Dem
 		return generateECDemoChain(domain, validityDuration)
 	}
 	return generatePQDemoChain(alg, domain, validityDuration)
+}
+
+// GenerateDemoKeyMaterial creates one demo leaf key and returns its SPKI DER
+// plus a PEM-encoded private key. It supports EC and the PQ schemes supported
+// by GenerateDemoChain.
+func GenerateDemoKeyMaterial(alg string) (*DemoKeyMaterial, error) {
+	if isEC(alg) {
+		key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		if err != nil {
+			return nil, fmt.Errorf("pqx509: generate EC key: %w", err)
+		}
+		spkiDER, err := x509.MarshalPKIXPublicKey(&key.PublicKey)
+		if err != nil {
+			return nil, fmt.Errorf("pqx509: marshal EC SPKI: %w", err)
+		}
+		keyDER, err := x509.MarshalECPrivateKey(key)
+		if err != nil {
+			return nil, fmt.Errorf("pqx509: marshal EC key: %w", err)
+		}
+		return &DemoKeyMaterial{
+			Algorithm:            "ec",
+			SubjectPublicKeyInfo: spkiDER,
+			KeyPEM:               pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER}),
+		}, nil
+	}
+
+	scheme := schemeByName(alg)
+	if scheme == nil {
+		return nil, fmt.Errorf("pqx509: unsupported algorithm %q", alg)
+	}
+	oid, err := oidForScheme(scheme.Name())
+	if err != nil {
+		return nil, err
+	}
+	pub, priv, err := scheme.GenerateKey()
+	if err != nil {
+		return nil, fmt.Errorf("pqx509: generate %s key: %w", scheme.Name(), err)
+	}
+	spkiDER, err := marshalPQSubjectPublicKeyInfo(pub, oid)
+	if err != nil {
+		return nil, err
+	}
+	keyDER, err := priv.MarshalBinary()
+	if err != nil {
+		return nil, fmt.Errorf("pqx509: marshal %s key: %w", scheme.Name(), err)
+	}
+	return &DemoKeyMaterial{
+		Algorithm:            scheme.Name(),
+		SubjectPublicKeyInfo: spkiDER,
+		KeyPEM:               pem.EncodeToMemory(&pem.Block{Type: scheme.Name() + " PRIVATE KEY", Bytes: keyDER}),
+	}, nil
 }
 
 func generateECDemoChain(domain string, validityDuration time.Duration) (*DemoChain, error) {
@@ -171,7 +230,7 @@ func generateECDemoChain(domain string, validityDuration time.Duration) (*DemoCh
 }
 
 func generatePQDemoChain(alg, domain string, validityDuration time.Duration) (*DemoChain, error) {
-	scheme := schemes.ByName(alg)
+	scheme := schemeByName(alg)
 	if scheme == nil {
 		return nil, fmt.Errorf("pqx509: unsupported algorithm %q", alg)
 	}
@@ -473,6 +532,20 @@ func isEC(alg string) bool {
 	default:
 		return false
 	}
+}
+
+func schemeByName(alg string) circlsign.Scheme {
+	name := strings.TrimSpace(alg)
+	if scheme := schemes.ByName(name); scheme != nil {
+		return scheme
+	}
+	upperName := strings.ToUpper(name)
+	for _, scheme := range schemes.All() {
+		if strings.ToUpper(scheme.Name()) == upperName {
+			return scheme
+		}
+	}
+	return nil
 }
 
 func reverseBitsInByte(in byte) byte {

@@ -31,6 +31,7 @@ import (
 	"crypto/sha256"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/asn1"
 	"encoding/hex"
 	"encoding/pem"
 	"flag"
@@ -44,16 +45,28 @@ import (
 	"github.com/briantrzupek/ca-extension-merkle/internal/merkle"
 	"github.com/briantrzupek/ca-extension-merkle/internal/mtccert"
 	"github.com/briantrzupek/ca-extension-merkle/internal/mtcformat"
+	"github.com/briantrzupek/ca-extension-merkle/internal/pqx509"
 )
 
 func main() {
 	domain := flag.String("domain", "demo.example.com", "domain name for the certificate")
 	output := flag.String("output", "", "output PEM file path (default: stdout)")
 	mtcMode := flag.Bool("mtc-mode", false, "generate MTC-spec cert (id-alg-mtcProof) instead of legacy X.509 extension")
+	normalX509 := flag.Bool("normal-x509", false, "generate a normal X.509 CA-signed certificate instead of an MTC demo certificate")
+	keyAlg := flag.String("key-alg", "ec", "subject public key algorithm for MTC mode: ec, ML-DSA-44, ML-DSA-65, ML-DSA-87, or SLH-DSA-*")
+	x509SigAlg := flag.String("x509-sig-alg", "ec", "normal X.509 signing/key algorithm: ec, ML-DSA-44, ML-DSA-65, ML-DSA-87, or SLH-DSA-*")
 	flag.Parse()
 
+	if *mtcMode && *normalX509 {
+		fatal("-mtc-mode and -normal-x509 are mutually exclusive")
+	}
+	if *normalX509 {
+		runNormalX509Mode(*domain, *output, *x509SigAlg)
+		return
+	}
+
 	if *mtcMode {
-		runMTCMode(*domain, *output)
+		runMTCMode(*domain, *output, *keyAlg)
 		return
 	}
 
@@ -231,49 +244,71 @@ func main() {
 	fmt.Fprintln(os.Stderr, "embedded as a non-critical X.509 extension at OID 1.3.6.1.4.1.99999.1.1")
 }
 
-func runMTCMode(domain, output string) {
+func runMTCMode(domain, output, keyAlg string) {
 	fmt.Fprintln(os.Stderr, "")
 	fmt.Fprintln(os.Stderr, "MTC-Spec Certificate Generation Demo")
 	fmt.Fprintln(os.Stderr, "=====================================")
 	fmt.Fprintln(os.Stderr, "  Format: signatureAlgorithm = id-alg-mtcProof")
 	fmt.Fprintln(os.Stderr, "  Proof embedded in signatureValue field")
+	fmt.Fprintf(os.Stderr, "  Subject key algorithm: %s\n", keyAlg)
 	fmt.Fprintln(os.Stderr, "")
 
-	// Step 1: Generate client key + CSR.
-	fmt.Fprintf(os.Stderr, "Step 1: Generating client CSR for %s...\n", domain)
-	clientKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	// Step 1: Generate subject key material. We avoid CSRs here because Go's
+	// x509 CSR builder cannot sign requests with these PQ demo key types.
+	fmt.Fprintf(os.Stderr, "Step 1: Generating subject key for %s...\n", domain)
+	keyMaterial, err := pqx509.GenerateDemoKeyMaterial(keyAlg)
 	if err != nil {
-		fatal("generate client key: %v", err)
+		fatal("generate subject key: %v", err)
 	}
-	csrTemplate := &x509.CertificateRequest{
-		Subject: pkix.Name{
-			CommonName:   domain,
-			Organization: []string{"MTC HSLU Demo"},
-			Country:      []string{"CH"},
-		},
-		DNSNames: []string{domain},
-	}
-	csrDER, err := x509.CreateCertificateRequest(rand.Reader, csrTemplate, clientKey)
-	if err != nil {
-		fatal("create CSR: %v", err)
-	}
-	csr, err := x509.ParseCertificateRequest(csrDER)
-	if err != nil {
-		fatal("parse CSR: %v", err)
-	}
+	fmt.Fprintf(os.Stderr, "        Algorithm: %s\n", keyMaterial.Algorithm)
+	fmt.Fprintf(os.Stderr, "        SPKI size: %d bytes DER\n", len(keyMaterial.SubjectPublicKeyInfo))
 	fmt.Fprintln(os.Stderr, "")
+
+	subject := pkix.Name{
+		CommonName:   domain,
+		Organization: []string{"MTC HSLU Demo"},
+		Country:      []string{"CH"},
+	}
+	subjectDER, err := asn1.Marshal(subject.ToRDNSequence())
+	if err != nil {
+		fatal("marshal subject: %v", err)
+	}
+	issuerRaw, err := mtcformat.BuildTrustAnchorDN("mtc-demo-log")
+	if err != nil {
+		fatal("build issuer DN: %v", err)
+	}
+	extensions, err := mtccert.BuildCertExtensions([]string{domain})
+	if err != nil {
+		fatal("build extensions: %v", err)
+	}
 
 	// Step 2: Build MerkleTreeCertEntry (spec log entry format).
 	fmt.Fprintln(os.Stderr, "Step 2: Building TBSCertificateLogEntry (SPKI hashed)...")
 	notBefore := time.Now().UTC().Truncate(time.Second)
 	notAfter := notBefore.Add(365 * 24 * time.Hour)
 
-	logEntryDER, err := mtcformat.BuildLogEntryFromCSR("mtc-demo-log", notBefore, notAfter, csr, []string{domain})
+	fields := mtccert.TBSFields{
+		Issuer:            issuerRaw,
+		NotBefore:         notBefore,
+		NotAfter:          notAfter,
+		Subject:           asn1.RawValue{FullBytes: subjectDER},
+		SubjectPubKeyInfo: keyMaterial.SubjectPublicKeyInfo,
+		Extensions:        extensions,
+	}
+
+	logEntryDER, err := mtcformat.BuildLogEntry(
+		fields.Issuer,
+		fields.Subject,
+		fields.NotBefore,
+		fields.NotAfter,
+		fields.SubjectPubKeyInfo,
+		fields.Extensions,
+	)
 	if err != nil {
 		fatal("build log entry: %v", err)
 	}
 
-	spkiHash := sha256.Sum256(csr.RawSubjectPublicKeyInfo)
+	spkiHash := sha256.Sum256(fields.SubjectPubKeyInfo)
 	fmt.Fprintf(os.Stderr, "        SPKI hash: %s\n", hex.EncodeToString(spkiHash[:]))
 	fmt.Fprintf(os.Stderr, "        Log entry: %d bytes DER\n", len(logEntryDER))
 
@@ -339,7 +374,7 @@ func runMTCMode(domain, output string) {
 
 	// Step 5: Build MTC certificate.
 	fmt.Fprintln(os.Stderr, "Step 5: Building MTC certificate (id-alg-mtcProof)...")
-	certDER, err := mtccert.BuildMTCCertFromCSR(csr, "mtc-demo-log", notBefore, notAfter, []string{domain}, leafIndex, mtcProof)
+	certDER, err := mtccert.BuildMTCCertificate(fields, leafIndex, mtcProof)
 	if err != nil {
 		fatal("build MTC cert: %v", err)
 	}
@@ -375,18 +410,13 @@ func runMTCMode(domain, output string) {
 
 	// Output the certificate PEM.
 	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
-	keyDER, err := x509.MarshalECPrivateKey(clientKey)
-	if err != nil {
-		fatal("marshal key: %v", err)
-	}
-	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
 
 	if output != "" {
 		if err := os.WriteFile(output, certPEM, 0644); err != nil {
 			fatal("write cert: %v", err)
 		}
 		keyOutput := strings.TrimSuffix(output, filepath.Ext(output)) + ".key"
-		if err := os.WriteFile(keyOutput, keyPEM, 0600); err != nil {
+		if err := os.WriteFile(keyOutput, keyMaterial.KeyPEM, 0600); err != nil {
 			fatal("write key: %v", err)
 		}
 		fmt.Fprintf(os.Stderr, "Certificate written to: %s\n", output)
@@ -403,6 +433,49 @@ func runMTCMode(domain, output string) {
 	fmt.Fprintln(os.Stderr, "")
 	fmt.Fprintln(os.Stderr, "Done. The certificate uses signatureAlgorithm = id-alg-mtcProof")
 	fmt.Fprintln(os.Stderr, "with the MTC inclusion proof in the signatureValue field.")
+}
+
+func runNormalX509Mode(domain, output, sigAlg string) {
+	fmt.Fprintln(os.Stderr, "")
+	fmt.Fprintln(os.Stderr, "Normal X.509 Certificate Generation Demo")
+	fmt.Fprintln(os.Stderr, "========================================")
+	fmt.Fprintf(os.Stderr, "  Algorithm: %s\n", sigAlg)
+	fmt.Fprintln(os.Stderr, "  Format:    standard X.509 CA signature")
+	fmt.Fprintln(os.Stderr, "")
+
+	chain, err := pqx509.GenerateDemoChain(sigAlg, domain, 365*24*time.Hour)
+	if err != nil {
+		fatal("generate normal X.509 certificate: %v", err)
+	}
+
+	fmt.Fprintf(os.Stderr, "Certificate algorithm: %s\n", chain.Algorithm)
+	fmt.Fprintf(os.Stderr, "Leaf cert size:        %d bytes DER\n", len(chain.CertDER))
+	fmt.Fprintf(os.Stderr, "CA cert size:          %d bytes DER\n", len(chain.CADER))
+	fmt.Fprintln(os.Stderr, "")
+
+	if output != "" {
+		chainPEM := append(chain.CertPEM, chain.CAPEM...)
+		if err := os.WriteFile(output, chainPEM, 0644); err != nil {
+			fatal("write cert: %v", err)
+		}
+		keyOutput := strings.TrimSuffix(output, filepath.Ext(output)) + ".key"
+		if err := os.WriteFile(keyOutput, chain.KeyPEM, 0600); err != nil {
+			fatal("write key: %v", err)
+		}
+		fmt.Fprintf(os.Stderr, "Certificate chain written to: %s\n", output)
+		fmt.Fprintf(os.Stderr, "Private key written to:      %s\n", keyOutput)
+		fmt.Fprintf(os.Stderr, "Inspect with: openssl x509 -in %s -text -noout\n", output)
+	} else {
+		fmt.Fprintln(os.Stderr, "--- BEGIN CERTIFICATE CHAIN PEM ---")
+		fmt.Fprintln(os.Stderr, "")
+		os.Stdout.Write(chain.CertPEM)
+		os.Stdout.Write(chain.CAPEM)
+		fmt.Fprintln(os.Stderr, "")
+		fmt.Fprintln(os.Stderr, "--- END CERTIFICATE CHAIN PEM ---")
+	}
+
+	fmt.Fprintln(os.Stderr, "")
+	fmt.Fprintln(os.Stderr, "Done. This certificate uses a normal X.509 signature, not id-alg-mtcProof.")
 }
 
 func fatal(format string, args ...interface{}) {
