@@ -110,14 +110,20 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Connect to CA MariaDB database.
-	caAdapter, err := cadb.New(ctx, cfg.CADB, logger.With("component", "cadb"))
-	if err != nil {
-		logger.Error("failed to connect to CA database", "error", err)
-		os.Exit(1)
+	// Optionally connect to the DigiCert CA MariaDB database. Local-only MTC
+	// deployments append certificate entries directly through the ACME flow.
+	var caAdapter *cadb.Adapter
+	if cfg.CADB.IsEnabled() {
+		caAdapter, err = cadb.New(ctx, cfg.CADB, logger.With("component", "cadb"))
+		if err != nil {
+			logger.Error("failed to connect to CA database", "error", err)
+			os.Exit(1)
+		}
+		defer caAdapter.Close()
+		logger.Info("connected to CA database")
+	} else {
+		logger.Info("CA database disabled; running in local-only issuance mode")
 	}
-	defer caAdapter.Close()
-	logger.Info("connected to CA database")
 
 	// Initialize cosigner.
 	cs, err := cosigner.New(cfg.Cosigner.KeyFile, cfg.Cosigner.KeyID, cfg.Log.Origin)
@@ -139,20 +145,26 @@ func main() {
 	// Create revocation manager.
 	revMgr := revocation.New(stateStore, logger.With("component", "revocation"))
 
-	// Create watcher.
-	watcherCfg := watcher.Config{
-		PollInterval:           cfg.Watcher.PollInterval,
-		CheckpointInterval:     cfg.Watcher.CheckpointInterval,
-		BatchSize:              cfg.Watcher.BatchSize,
-		RevocationPollInterval: cfg.Watcher.RevocationPollInterval,
-		HousekeepingInterval:   cfg.Watcher.HousekeepingInterval,
-		StaleBundleRetention:   cfg.Watcher.StaleBundleRetention,
-		CheckpointRetention:    cfg.Watcher.CheckpointRetention,
-		CheckpointKeepRecent:   cfg.Watcher.CheckpointKeepRecent,
-		EventRetention:         cfg.Watcher.EventRetention,
-		EventKeepRecent:        cfg.Watcher.EventKeepRecent,
+	// Create watcher only when the DigiCert CA database integration is enabled.
+	var w *watcher.Watcher
+	if caAdapter != nil {
+		watcherCfg := watcher.Config{
+			PollInterval:           cfg.Watcher.PollInterval,
+			CheckpointInterval:     cfg.Watcher.CheckpointInterval,
+			BatchSize:              cfg.Watcher.BatchSize,
+			RevocationPollInterval: cfg.Watcher.RevocationPollInterval,
+			HousekeepingInterval:   cfg.Watcher.HousekeepingInterval,
+			StaleBundleRetention:   cfg.Watcher.StaleBundleRetention,
+			CheckpointRetention:    cfg.Watcher.CheckpointRetention,
+			CheckpointKeepRecent:   cfg.Watcher.CheckpointKeepRecent,
+			EventRetention:         cfg.Watcher.EventRetention,
+			EventKeepRecent:        cfg.Watcher.EventKeepRecent,
+		}
+		w = watcher.New(caAdapter, stateStore, ilog, revMgr, watcherCfg, logger.With("component", "watcher"))
+	} else if err := ilog.Initialize(ctx); err != nil {
+		logger.Error("failed to initialize local issuance log", "error", err)
+		os.Exit(1)
 	}
-	w := watcher.New(caAdapter, stateStore, ilog, revMgr, watcherCfg, logger.With("component", "watcher"))
 
 	// Create assertion issuer and hook into watcher.
 	issuerCfg := assertionissuer.Config{
@@ -169,7 +181,9 @@ func main() {
 		})
 	}
 	issuer := assertionissuer.New(stateStore, cfg.Log.Origin, issuerCfg, logger.With("component", "assertionissuer"))
-	w.OnCheckpoint(issuer.RunOnCheckpoint)
+	if w != nil {
+		w.OnCheckpoint(issuer.RunOnCheckpoint)
+	}
 	logger.Info("assertion issuer configured",
 		"enabled", issuerCfg.Enabled,
 		"batch_size", issuerCfg.BatchSize,
@@ -179,8 +193,10 @@ func main() {
 
 	// Build CA name map for admin visualization.
 	caNameMap := make(map[string]string)
-	for _, ca := range caAdapter.GetCAs() {
-		caNameMap[ca.ID] = ca.Name
+	if caAdapter != nil {
+		for _, ca := range caAdapter.GetCAs() {
+			caNameMap[ca.ID] = ca.Name
+		}
 	}
 
 	// Create HTTP handlers.
@@ -293,12 +309,14 @@ func main() {
 		BaseContext:  func(_ net.Listener) context.Context { return ctx },
 	}
 
-	// Start watcher in background.
-	go func() {
-		if err := w.Run(ctx); err != nil && ctx.Err() == nil {
-			logger.Error("watcher error", "error", err)
-		}
-	}()
+	// Start watcher in background when DigiCert CA DB polling is enabled.
+	if w != nil {
+		go func() {
+			if err := w.Run(ctx); err != nil && ctx.Err() == nil {
+				logger.Error("watcher error", "error", err)
+			}
+		}()
+	}
 
 	// Start HTTP server in background.
 	go func() {

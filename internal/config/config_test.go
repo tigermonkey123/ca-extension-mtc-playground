@@ -110,6 +110,22 @@ func TestValidate(t *testing.T) {
 	}
 }
 
+func TestValidateWithDisabledCADB(t *testing.T) {
+	disabled := false
+	cfg := &Config{
+		CADB: MariaDBConfig{Enabled: &disabled},
+	}
+	applyDefaults(cfg)
+	cfg.StateDB.Host = "localhost"
+	cfg.StateDB.Username = "user"
+	cfg.Cosigner.KeyFile = "/etc/mtc-bridge/key.pem"
+
+	err := cfg.Validate()
+	if err != nil {
+		t.Errorf("unexpected validation error with disabled ca_db: %v", err)
+	}
+}
+
 func TestParseLogLevel(t *testing.T) {
 	tests := []struct {
 		input string

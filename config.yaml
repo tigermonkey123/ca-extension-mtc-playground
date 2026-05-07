@@ -25,6 +25,7 @@ state_db:
   conn_max_lifetime: 5m
 
 ca_db:
+  enabled: false
   host: "${MTC_CADB_HOST:-localhost}"
   port: ${MTC_CADB_PORT:-3306}
   database: "${MTC_CADB_DATABASE:-digicert_ca}"
@@ -65,11 +66,12 @@ assertion_issuer:
 
 local_ca:
   enabled: true
+  mtc_mode: true
   key_file: "${MTC_LOCAL_CA_KEY:-keys/local-ca.key}"
   cert_file: "${MTC_LOCAL_CA_CERT:-keys/local-ca.pem}"
   validity: 8760h    # 1 year
-  organization: "MTC Demo CA"
-  country: "US"
+  organization: "MTC HSLU CA"
+  country: "CH"
 
 acme:
   enabled: true
@@ -85,5 +87,5 @@ acme:
   assertion_poll_interval: 5s
   auto_approve_challenge: true  # skip http-01 for internal CA
 
-  tls_cert: "/etc/mtc-bridge/acme-cert.pem"
-  tls_key: "/etc/mtc-bridge/acme-key.pem"
+  tls_cert: "./acme-keys/acme-cert.pem"
+  tls_key: "./acme-keys/acme-key.pem"

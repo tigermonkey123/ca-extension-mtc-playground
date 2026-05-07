@@ -248,8 +248,8 @@ func runMTCMode(domain, output string) {
 	csrTemplate := &x509.CertificateRequest{
 		Subject: pkix.Name{
 			CommonName:   domain,
-			Organization: []string{"MTC Demo"},
-			Country:      []string{"US"},
+			Organization: []string{"MTC HSLU Demo"},
+			Country:      []string{"CH"},
 		},
 		DNSNames: []string{domain},
 	}

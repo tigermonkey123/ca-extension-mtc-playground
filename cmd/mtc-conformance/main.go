@@ -28,6 +28,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/pem"
 	"flag"
 	"fmt"
 	"io"
@@ -1173,9 +1174,9 @@ func (c *conformanceClient) testACMEOrderFlow() error {
 	return fmt.Errorf("order did not reach ready state within timeout, last status=%v", order["status"])
 }
 
-// testACMEFullMTCFlow exercises the complete ACME → DigiCert CA → MTC assertion pipeline:
-// account → order → challenge → finalize(CSR) → CA issues cert → watcher logs cert →
-// assertion issuer generates inclusion proof → certificate download with MTC bundle.
+// testACMEFullMTCFlow exercises the complete ACME → MTC certificate pipeline:
+// account → order → challenge → finalize(CSR) → certificate issuance → MTC proof
+// delivered either as an embedded MTC certificate proof or as an assertion bundle.
 func (c *conformanceClient) testACMEFullMTCFlow() error {
 	acmeKey, err := c.acmeKey()
 	if err != nil {
@@ -1299,7 +1300,7 @@ func (c *conformanceClient) testACMEFullMTCFlow() error {
 		ExtraExtensions: []pkix.Extension{
 			{
 				Id:    asn1.ObjectIdentifier{2, 5, 29, 17}, // SAN OID
-				Value: nil,                                  // x509 fills from DNSNames
+				Value: nil,                                 // x509 fills from DNSNames
 			},
 		},
 	}
@@ -1366,7 +1367,9 @@ func (c *conformanceClient) testACMEFullMTCFlow() error {
 		fmt.Printf("    order valid! certificate: %s\n", certURL)
 	}
 
-	// Step 8: Download certificate — should contain X.509 cert + MTC assertion bundle.
+	// Step 8: Download certificate. Local MTC mode returns an id-alg-mtcProof
+	// certificate with the proof in signatureValue; DigiCert proxy mode returns a
+	// normal certificate with a companion MTC assertion bundle appended.
 	body, status, _, err = c.acmePost(certURL, acmeKey, nil, kid)
 	if err != nil {
 		return fmt.Errorf("download cert: %w", err)
@@ -1385,15 +1388,25 @@ func (c *conformanceClient) testACMEFullMTCFlow() error {
 		fmt.Printf("    certificate PEM: %d bytes\n", len(certPEM))
 	}
 
-	// Verify MTC Assertion Bundle is present — this is the Google MTC integration.
-	if !strings.Contains(certPEM, "-----BEGIN MTC ASSERTION BUNDLE-----") {
-		// The assertion bundle may not be ready yet if the watcher hasn't polled.
-		// This is still a valid cert but without the MTC proof.
+	// Local CA MTC mode embeds the proof directly in the certificate, so a
+	// separate assertion bundle is not expected.
+	if err := verifyDownloadedMTCCertificate(certPEM); err == nil {
 		if c.verbose {
-			fmt.Printf("    WARNING: MTC assertion bundle not yet attached (watcher may not have polled)\n")
+			fmt.Printf("    MTC certificate proof verified from signatureValue\n")
+			fmt.Printf("    FULL MTC FLOW COMPLETE: local ACME CA → Merkle tree → MTC certificate proof embedded\n")
+		}
+		return nil
+	} else if c.verbose {
+		fmt.Printf("    not an embedded MTC certificate: %v\n", err)
+	}
+
+	// Verify MTC Assertion Bundle is present for DigiCert proxy mode.
+	if !strings.Contains(certPEM, "-----BEGIN MTC ASSERTION BUNDLE-----") {
+		if c.verbose {
+			fmt.Printf("    WARNING: no embedded MTC certificate proof or appended assertion bundle found\n")
 		}
 		return fmt.Errorf("MTC assertion bundle missing from certificate download — " +
-			"cert was issued but not yet logged in the transparency tree")
+			"cert was issued but no MTC proof was delivered")
 	}
 	if !strings.Contains(certPEM, "-----END MTC ASSERTION BUNDLE-----") {
 		return fmt.Errorf("MTC assertion bundle PEM incomplete")
@@ -1423,6 +1436,24 @@ func (c *conformanceClient) testACMEFullMTCFlow() error {
 		fmt.Printf("    FULL MTC FLOW COMPLETE: cert issued via DigiCert CA → logged in Merkle tree → assertion bundle attached\n")
 	}
 
+	return nil
+}
+
+func verifyDownloadedMTCCertificate(certPEM string) error {
+	block, _ := pem.Decode([]byte(certPEM))
+	if block == nil || block.Type != "CERTIFICATE" {
+		return fmt.Errorf("no certificate PEM block found")
+	}
+	if !mtccert.IsMTCCertificate(block.Bytes) {
+		return fmt.Errorf("first certificate is not id-alg-mtcProof")
+	}
+	result, err := mtccert.VerifyMTCCert(block.Bytes, mtccert.VerifyOptions{})
+	if err != nil {
+		return fmt.Errorf("verify MTC cert: %w", err)
+	}
+	if !result.ProofValid {
+		return fmt.Errorf("embedded MTC proof invalid")
+	}
 	return nil
 }
 

@@ -214,6 +214,10 @@ func (c PostgresConfig) DSN() string {
 
 // MariaDBConfig configures the DigiCert CA MariaDB connection.
 type MariaDBConfig struct {
+	// Enabled controls whether mtc-bridge connects to the DigiCert CA database.
+	// Defaults to true for existing DigiCert-backed deployments.
+	Enabled *bool `yaml:"enabled"`
+
 	Host     string `yaml:"host"`
 	Port     int    `yaml:"port"`
 	Database string `yaml:"database"`
@@ -222,6 +226,14 @@ type MariaDBConfig struct {
 
 	// IssuerID filters certificates to a specific CA issuer. Empty means all.
 	IssuerID string `yaml:"issuer_id"`
+}
+
+// IsEnabled returns whether the DigiCert CA database integration is enabled.
+func (c MariaDBConfig) IsEnabled() bool {
+	if c.Enabled == nil {
+		return true
+	}
+	return *c.Enabled
 }
 
 // DSN returns the MariaDB connection string for go-sql-driver/mysql.
@@ -515,11 +527,13 @@ func (c *Config) Validate() error {
 	if c.StateDB.Username == "" {
 		errs = append(errs, "state_db.username is required")
 	}
-	if c.CADB.Host == "" {
-		errs = append(errs, "ca_db.host is required")
-	}
-	if c.CADB.Username == "" {
-		errs = append(errs, "ca_db.username is required")
+	if c.CADB.IsEnabled() {
+		if c.CADB.Host == "" {
+			errs = append(errs, "ca_db.host is required")
+		}
+		if c.CADB.Username == "" {
+			errs = append(errs, "ca_db.username is required")
+		}
 	}
 	if c.Cosigner.KeyFile == "" {
 		errs = append(errs, "cosigner.key_file is required")
