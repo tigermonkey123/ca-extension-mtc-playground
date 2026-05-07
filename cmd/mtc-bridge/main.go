@@ -14,6 +14,8 @@ package main
 
 import (
 	"context"
+	"encoding/hex"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -21,6 +23,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -125,19 +128,38 @@ func main() {
 		logger.Info("CA database disabled; running in local-only issuance mode")
 	}
 
-	// Initialize cosigner.
-	cs, err := cosigner.New(cfg.Cosigner.KeyFile, cfg.Cosigner.KeyID, cfg.Log.Origin)
+	// Initialize cosigners.
+	cs, err := loadPrimaryCosigner(cfg, logger)
 	if err != nil {
 		logger.Error("failed to initialize cosigner", "error", err)
 		os.Exit(1)
 	}
-	// Set the cosigner's TrustAnchorID from the log origin.
-	cs.SetCosignerID([]byte(cfg.Log.Origin))
 	logger.Info("cosigner initialized",
 		"key_id", cs.KeyID(),
 		"origin", cs.Origin(),
+		"algorithm", cs.Algorithm().String(),
+		"cosigner_id", string(cs.CosignerID()),
 		"public_key", cs.PublicKeyHex(),
 	)
+	cosigners := []*cosigner.Cosigner{cs}
+	for _, additional := range cfg.AdditionalCosigners {
+		additionalCS, err := loadAdditionalCosigner(cfg.Log.Origin, additional)
+		if err != nil {
+			logger.Error("failed to initialize additional cosigner",
+				"key_id", additional.KeyID,
+				"algorithm", additional.Algorithm,
+				"error", err,
+			)
+			os.Exit(1)
+		}
+		logger.Info("additional cosigner initialized",
+			"key_id", additionalCS.KeyID(),
+			"algorithm", additionalCS.Algorithm().String(),
+			"cosigner_id", string(additionalCS.CosignerID()),
+			"public_key", additionalCS.PublicKeyHex(),
+		)
+		cosigners = append(cosigners, additionalCS)
+	}
 
 	// Create issuance log.
 	ilog := issuancelog.New(stateStore, cs, cfg.Log.Origin, logger.With("component", "issuancelog"))
@@ -225,6 +247,7 @@ func main() {
 			AssertionPollInterval: cfg.ACME.AssertionPollInterval,
 			AutoApproveChallenge:  cfg.ACME.AutoApproveChallenge,
 			MTCMode:               cfg.LocalCA.MTCMode,
+			MTCProfile:            cfg.LocalCA.MTCProfile,
 		}
 
 		// Optionally initialize local CA for embedded proof issuance.
@@ -247,7 +270,7 @@ func main() {
 			)
 		}
 
-		acmeSrv := acme.New(stateStore, acmeCfg, logger.With("component", "acme"), lca, ilog)
+		acmeSrv := acme.New(stateStore, acmeCfg, logger.With("component", "acme"), lca, ilog, cosigners)
 		acmeServer := &http.Server{
 			Addr:         cfg.ACME.Addr,
 			Handler:      acmeSrv,
@@ -293,6 +316,32 @@ func main() {
 	mux.Handle("/assertions/", tlogHandler)
 	mux.Handle("/admin", adminHandler)
 	mux.Handle("/admin/", adminHandler)
+	mux.HandleFunc("GET /cosigners", func(w http.ResponseWriter, r *http.Request) {
+		type cosignerJSON struct {
+			CosignerID string `json:"cosigner_id"`
+			KeyID      string `json:"key_id"`
+			Algorithm  string `json:"algorithm"`
+			PublicKey  string `json:"public_key"`
+		}
+		result := struct {
+			LogID     string         `json:"log_id"`
+			Cosigners []cosignerJSON `json:"cosigners"`
+		}{
+			LogID: cfg.ACME.MTCBridgeURL,
+		}
+		for _, cs := range cosigners {
+			result.Cosigners = append(result.Cosigners, cosignerJSON{
+				CosignerID: string(cs.CosignerID()),
+				KeyID:      cs.KeyID(),
+				Algorithm:  cs.Algorithm().String(),
+				PublicKey:  hex.EncodeToString(cs.PublicKeyBytes()),
+			})
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(result); err != nil {
+			logger.Warn("encode cosigner trust material failed", "error", err)
+		}
+	})
 
 	// Health check endpoint.
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -339,4 +388,63 @@ func main() {
 	}
 
 	logger.Info("mtc-bridge stopped")
+}
+
+func loadPrimaryCosigner(cfg *config.Config, logger *slog.Logger) (*cosigner.Cosigner, error) {
+	alg, err := cosigner.ParseAlgorithm(cfg.Cosigner.Algorithm)
+	if err != nil {
+		return nil, err
+	}
+
+	var cs *cosigner.Cosigner
+	switch alg {
+	case cosigner.AlgEd25519:
+		cs, err = cosigner.New(cfg.Cosigner.KeyFile, cfg.Cosigner.KeyID, cfg.Log.Origin)
+	default:
+		cs, err = cosigner.NewMLDSA(cfg.Cosigner.KeyFile, alg, cfg.Cosigner.KeyID, cfg.Log.Origin, primaryCosignerID(cfg))
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	if alg == cosigner.AlgEd25519 {
+		cs.SetCosignerID(primaryCosignerID(cfg))
+	}
+	if len(cs.CosignerID()) == 0 {
+		logger.Warn("primary cosigner ID is empty; using log origin", "origin", cfg.Log.Origin)
+		cs.SetCosignerID([]byte(cfg.Log.Origin))
+	}
+	return cs, nil
+}
+
+func primaryCosignerID(cfg *config.Config) []byte {
+	if cfg.Cosigner.CosignerID != 0 {
+		return []byte(strconv.FormatUint(uint64(cfg.Cosigner.CosignerID), 10))
+	}
+	return []byte(cfg.Log.Origin)
+}
+
+func loadAdditionalCosigner(origin string, cfg config.AdditionalCosignerConfig) (*cosigner.Cosigner, error) {
+	alg, err := cosigner.ParseAlgorithm(cfg.Algorithm)
+	if err != nil {
+		return nil, err
+	}
+	id := []byte(cfg.CosignerID)
+	if len(id) == 0 {
+		id = []byte(cfg.KeyID)
+	}
+	if len(id) == 0 {
+		return nil, fmt.Errorf("additional cosigner requires cosigner_id or key_id")
+	}
+	switch alg {
+	case cosigner.AlgEd25519:
+		cs, err := cosigner.New(cfg.KeyFile, cfg.KeyID, origin)
+		if err != nil {
+			return nil, err
+		}
+		cs.SetCosignerID(id)
+		return cs, nil
+	default:
+		return cosigner.NewMLDSA(cfg.KeyFile, alg, cfg.KeyID, origin, id)
+	}
 }

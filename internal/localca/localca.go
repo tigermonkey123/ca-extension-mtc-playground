@@ -38,10 +38,10 @@ type Config struct {
 
 // LocalCA is a locally-controlled intermediate CA for two-phase MTC signing.
 type LocalCA struct {
-	key       *ecdsa.PrivateKey
-	cert      *x509.Certificate
-	certDER   []byte
-	validity  time.Duration
+	key      *ecdsa.PrivateKey
+	cert     *x509.Certificate
+	certDER  []byte
+	validity time.Duration
 }
 
 // New loads a LocalCA from existing key and certificate files.
@@ -95,13 +95,18 @@ func (ca *LocalCA) CACert() *x509.Certificate {
 	return ca.cert
 }
 
+// DefaultValidity returns the configured leaf certificate validity duration.
+func (ca *LocalCA) DefaultValidity() time.Duration {
+	return ca.validity
+}
+
 // PrecertResult holds the output of IssuePrecert.
 type PrecertResult struct {
-	PrecertDER   []byte           // Full signed pre-certificate DER
-	CanonicalTBS []byte           // TBSCertificate DER (canonical form for hashing)
-	Serial       *big.Int         // Certificate serial number
-	NotBefore    time.Time        // Validity start (needed for IssueWithProof)
-	NotAfter     time.Time        // Validity end
+	PrecertDER   []byte            // Full signed pre-certificate DER
+	CanonicalTBS []byte            // TBSCertificate DER (canonical form for hashing)
+	Serial       *big.Int          // Certificate serial number
+	NotBefore    time.Time         // Validity start (needed for IssueWithProof)
+	NotAfter     time.Time         // Validity end
 	Template     *x509.Certificate // The template used (for reference)
 }
 
@@ -268,7 +273,21 @@ func (ca *LocalCA) IssueMTCCert(
 	}
 
 	now := time.Now().UTC().Truncate(time.Second)
+	return ca.IssueMTCCertWithValidity(csr, dnsNames, now, now.Add(validity), leafIndex, proof, logID)
+}
 
+// IssueMTCCertWithValidity constructs an MTC certificate with an explicit
+// validity window. The caller is responsible for using the same window in the
+// TBSCertificateLogEntry that was appended to the Merkle tree.
+func (ca *LocalCA) IssueMTCCertWithValidity(
+	csr *x509.CertificateRequest,
+	dnsNames []string,
+	notBefore time.Time,
+	notAfter time.Time,
+	leafIndex int64,
+	proof *mtcformat.MTCProof,
+	logID string,
+) ([]byte, error) {
 	// Build issuer DN using trust anchor ID format per MTC spec §5.2.
 	issuerRaw, err := mtcformat.BuildTrustAnchorDN(logID)
 	if err != nil {
@@ -291,8 +310,8 @@ func (ca *LocalCA) IssueMTCCert(
 
 	fields := mtccert.TBSFields{
 		Issuer:            issuerRaw,
-		NotBefore:         now,
-		NotAfter:          now.Add(validity),
+		NotBefore:         notBefore,
+		NotAfter:          notAfter,
 		Subject:           asn1.RawValue{FullBytes: subjectDER},
 		SubjectPubKeyInfo: csr.RawSubjectPublicKeyInfo,
 		Extensions:        extensions,

@@ -1390,7 +1390,7 @@ func (c *conformanceClient) testACMEFullMTCFlow() error {
 
 	// Local CA MTC mode embeds the proof directly in the certificate, so a
 	// separate assertion bundle is not expected.
-	if err := verifyDownloadedMTCCertificate(certPEM); err == nil {
+	if err := c.verifyDownloadedMTCCertificate(certPEM); err == nil {
 		if c.verbose {
 			fmt.Printf("    MTC certificate proof verified from signatureValue\n")
 			fmt.Printf("    FULL MTC FLOW COMPLETE: local ACME CA → Merkle tree → MTC certificate proof embedded\n")
@@ -1439,7 +1439,7 @@ func (c *conformanceClient) testACMEFullMTCFlow() error {
 	return nil
 }
 
-func verifyDownloadedMTCCertificate(certPEM string) error {
+func (c *conformanceClient) verifyDownloadedMTCCertificate(certPEM string) error {
 	block, _ := pem.Decode([]byte(certPEM))
 	if block == nil || block.Type != "CERTIFICATE" {
 		return fmt.Errorf("no certificate PEM block found")
@@ -1447,7 +1447,15 @@ func verifyDownloadedMTCCertificate(certPEM string) error {
 	if !mtccert.IsMTCCertificate(block.Bytes) {
 		return fmt.Errorf("first certificate is not id-alg-mtcProof")
 	}
-	result, err := mtccert.VerifyMTCCert(block.Bytes, mtccert.VerifyOptions{})
+	opts := mtccert.VerifyOptions{}
+	trust, err := c.fetchCosignerTrust()
+	if err == nil {
+		opts.LogID = []byte(trust.LogID)
+		opts.CosignerKeys = trust.CosignerKeys
+	} else if c.verbose {
+		fmt.Printf("    could not load cosigner trust material: %v\n", err)
+	}
+	result, err := mtccert.VerifyMTCCert(block.Bytes, opts)
 	if err != nil {
 		return fmt.Errorf("verify MTC cert: %w", err)
 	}
@@ -1455,6 +1463,46 @@ func verifyDownloadedMTCCertificate(certPEM string) error {
 		return fmt.Errorf("embedded MTC proof invalid")
 	}
 	return nil
+}
+
+type conformanceCosignerTrust struct {
+	LogID        string
+	CosignerKeys map[string]mtccert.CosignerKey
+}
+
+func (c *conformanceClient) fetchCosignerTrust() (*conformanceCosignerTrust, error) {
+	body, status, err := c.get("/cosigners")
+	if err != nil {
+		return nil, err
+	}
+	if status != http.StatusOK {
+		return nil, fmt.Errorf("bridge returned %d for /cosigners", status)
+	}
+
+	var response struct {
+		LogID     string `json:"log_id"`
+		Cosigners []struct {
+			CosignerID string `json:"cosigner_id"`
+			Algorithm  string `json:"algorithm"`
+			PublicKey  string `json:"public_key"`
+		} `json:"cosigners"`
+	}
+	if err := json.Unmarshal(body, &response); err != nil {
+		return nil, err
+	}
+
+	keys := make(map[string]mtccert.CosignerKey)
+	for _, cs := range response.Cosigners {
+		pub, err := hex.DecodeString(cs.PublicKey)
+		if err != nil {
+			return nil, fmt.Errorf("decode public key for %q: %w", cs.CosignerID, err)
+		}
+		keys[cs.CosignerID] = mtccert.CosignerKey{
+			Algorithm: cs.Algorithm,
+			PublicKey: pub,
+		}
+	}
+	return &conformanceCosignerTrust{LogID: response.LogID, CosignerKeys: keys}, nil
 }
 
 // --- MTC Spec Conformance Tests (standalone, no server required) ---

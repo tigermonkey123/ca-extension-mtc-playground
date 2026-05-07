@@ -1,0 +1,13 @@
+{
+	"email": "mtc@yven.ch",
+	"registration": {
+		"body": {
+			"status": "valid",
+			"contact": [
+				"mailto:mtc@yven.ch"
+			],
+			"orders": "https://localhost:8443/acme/account/HMs2AedgIm8DM7tX/orders"
+		},
+		"uri": "https://localhost:8443/acme/account/HMs2AedgIm8DM7tX"
+	}
+}

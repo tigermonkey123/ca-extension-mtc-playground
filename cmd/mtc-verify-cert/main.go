@@ -97,7 +97,7 @@ func verifyMTCFormat(certDER []byte) {
 	}
 	fmt.Printf("Signatures:     %d\n", len(parsed.Proof.Signatures))
 	for i, sig := range parsed.Proof.Signatures {
-		fmt.Printf("  sig[%d]: cosigner_id=%d, %d bytes\n", i, sig.CosignerID, len(sig.Signature))
+		fmt.Printf("  sig[%d]: cosigner_id=%q, %d bytes\n", i, string(sig.CosignerID), len(sig.Signature))
 	}
 	if len(parsed.Proof.Signatures) == 0 {
 		fmt.Printf("Mode:           signatureless\n")
@@ -106,8 +106,21 @@ func verifyMTCFormat(certDER []byte) {
 	}
 	fmt.Println()
 
-	// Verify the inclusion proof.
-	result, err := mtccert.VerifyMTCCert(certDER, mtccert.VerifyOptions{})
+	opts := mtccert.VerifyOptions{}
+	if *bridgeURL != "" {
+		trust, err := fetchCosignerTrust()
+		if err != nil {
+			fmt.Printf("[WARN] Could not fetch cosigner trust material: %v\n", err)
+		} else {
+			opts.LogID = []byte(trust.LogID)
+			opts.CosignerKeys = trust.CosignerKeys
+			fmt.Printf("[INFO] Loaded %d trusted cosigner keys from bridge\n", len(opts.CosignerKeys))
+		}
+	}
+
+	// Verify the inclusion proof and, for signed standalone proofs, trusted
+	// cosigner signatures when trust material is available.
+	result, err := mtccert.VerifyMTCCert(certDER, opts)
 	if err != nil {
 		fmt.Printf("[FAIL] Verification error: %v\n", err)
 		os.Exit(1)
@@ -117,11 +130,17 @@ func verifyMTCFormat(certDER []byte) {
 		fmt.Printf("[PASS] Inclusion proof valid (leaf %d in subtree [%d, %d))\n",
 			result.LeafIndex, result.SubtreeStart, result.SubtreeEnd)
 	} else {
-		fmt.Printf("[FAIL] Inclusion proof invalid\n")
+		fmt.Printf("[FAIL] MTC proof invalid\n")
 	}
 	fmt.Printf("[INFO] Mode: %s\n", result.Mode)
 	if result.SignaturesVerified > 0 {
-		fmt.Printf("[INFO] %d cosigner signatures present\n", result.SignaturesVerified)
+		fmt.Printf("[PASS] %d trusted cosigner signature(s) verified\n", result.SignaturesVerified)
+	} else if len(parsed.Proof.Signatures) > 0 {
+		if *bridgeURL == "" {
+			fmt.Printf("[WARN] No trusted cosigner signatures verified; use -bridge-url to load /cosigners\n")
+		} else {
+			fmt.Printf("[FAIL] No trusted cosigner signatures verified\n")
+		}
 	}
 
 	// Bridge checkpoint verification for MTC certs.
@@ -130,6 +149,49 @@ func verifyMTCFormat(certDER []byte) {
 		fmt.Println("--- Bridge Checkpoint ---")
 		verifyMTCCheckpoint(parsed)
 	}
+}
+
+type cosignerTrust struct {
+	LogID        string
+	CosignerKeys map[string]mtccert.CosignerKey
+}
+
+func fetchCosignerTrust() (*cosignerTrust, error) {
+	url := strings.TrimRight(*bridgeURL, "/") + "/cosigners"
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Get(url)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("bridge returned %d for /cosigners", resp.StatusCode)
+	}
+
+	var body struct {
+		LogID     string `json:"log_id"`
+		Cosigners []struct {
+			CosignerID string `json:"cosigner_id"`
+			Algorithm  string `json:"algorithm"`
+			PublicKey  string `json:"public_key"`
+		} `json:"cosigners"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		return nil, err
+	}
+
+	keys := make(map[string]mtccert.CosignerKey)
+	for _, c := range body.Cosigners {
+		pub, err := hex.DecodeString(c.PublicKey)
+		if err != nil {
+			return nil, fmt.Errorf("decode public key for %q: %w", c.CosignerID, err)
+		}
+		keys[c.CosignerID] = mtccert.CosignerKey{
+			Algorithm: c.Algorithm,
+			PublicKey: pub,
+		}
+	}
+	return &cosignerTrust{LogID: body.LogID, CosignerKeys: keys}, nil
 }
 
 func verifyMTCCheckpoint(parsed *mtccert.ParsedMTCCert) {

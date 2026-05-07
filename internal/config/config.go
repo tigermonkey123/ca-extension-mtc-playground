@@ -153,6 +153,10 @@ type LocalCAConfig struct {
 	// with the MTCProof in signatureValue instead of a cryptographic signature.
 	MTCMode bool `yaml:"mtc_mode"`
 
+	// MTCProfile selects the MTC certificate proof profile.
+	// Supported values: "signatureless" (default), "standalone".
+	MTCProfile string `yaml:"mtc_profile"`
+
 	// KeyFile is the path to the ECDSA P-256 private key (PEM).
 	KeyFile string `yaml:"key_file"`
 
@@ -499,6 +503,9 @@ func applyDefaults(cfg *Config) {
 	if cfg.ACME.AssertionPollInterval <= 0 {
 		cfg.ACME.AssertionPollInterval = 5 * time.Second
 	}
+	if cfg.LocalCA.MTCProfile == "" {
+		cfg.LocalCA.MTCProfile = "signatureless"
+	}
 }
 
 // ParseLogLevel parses a log level string into an slog.Level.
@@ -537,6 +544,11 @@ func (c *Config) Validate() error {
 	}
 	if c.Cosigner.KeyFile == "" {
 		errs = append(errs, "cosigner.key_file is required")
+	}
+	switch strings.ToLower(c.LocalCA.MTCProfile) {
+	case "", "signatureless", "standalone":
+	default:
+		errs = append(errs, "local_ca.mtc_profile must be signatureless or standalone")
 	}
 
 	if len(errs) > 0 {

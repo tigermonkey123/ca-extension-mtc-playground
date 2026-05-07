@@ -9,10 +9,16 @@
 package mtccert
 
 import (
+	"crypto/ed25519"
+	"encoding/hex"
 	"fmt"
+	"strings"
 
 	"github.com/briantrzupek/ca-extension-merkle/internal/merkle"
 	"github.com/briantrzupek/ca-extension-merkle/internal/mtcformat"
+	"github.com/cloudflare/circl/sign/mldsa/mldsa44"
+	"github.com/cloudflare/circl/sign/mldsa/mldsa65"
+	"github.com/cloudflare/circl/sign/mldsa/mldsa87"
 )
 
 // CosignerKey holds a cosigner's public key for signature verification.
@@ -23,7 +29,8 @@ type CosignerKey struct {
 
 // VerifyOptions configures how MTC certificate verification works.
 type VerifyOptions struct {
-	// CosignerKeys maps cosigner TrustAnchorID (hex-encoded) → public key for signed mode verification.
+	// CosignerKeys maps cosigner TrustAnchorID (ASCII or hex-encoded) to
+	// public key for signed standalone mode verification.
 	CosignerKeys map[string]CosignerKey
 
 	// Landmarks maps tree_size → root hash for signatureless mode verification.
@@ -115,20 +122,87 @@ func VerifyMTCCert(certDER []byte, opts VerifyOptions) (*VerifyResult, error) {
 	// Step 6: Determine mode and verify accordingly.
 	if len(proof.Signatures) > 0 {
 		result.Mode = "signed"
-		// Count signatures present. Full crypto verification of cosigner
-		// signatures requires the cosigner module and keys from VerifyOptions.
-		result.SignaturesVerified = len(proof.Signatures)
+		if proofValid {
+			for _, sig := range proof.Signatures {
+				key, ok := lookupCosignerKey(opts.CosignerKeys, sig.CosignerID)
+				if !ok {
+					continue
+				}
+				if verifyMTCSignature(key, opts.LogID, proof.Start, proof.End, subtreeRoot, sig) {
+					result.SignaturesVerified++
+				}
+			}
+			result.ProofValid = result.SignaturesVerified > 0
+		}
 	} else {
 		result.Mode = "signatureless"
 		// In signatureless mode, verify the subtree root against a known landmark.
 		if opts.Landmarks != nil {
 			if expectedRoot, ok := opts.Landmarks[int64(proof.End)]; ok {
-				if subtreeRoot != expectedRoot {
-					proofValid = false
-				}
+				result.ProofValid = proofValid && subtreeRoot == expectedRoot
 			}
 		}
 	}
 
 	return result, nil
+}
+
+func lookupCosignerKey(keys map[string]CosignerKey, id []byte) (CosignerKey, bool) {
+	if len(keys) == 0 {
+		return CosignerKey{}, false
+	}
+	if key, ok := keys[string(id)]; ok {
+		return key, true
+	}
+	key, ok := keys[hex.EncodeToString(id)]
+	return key, ok
+}
+
+func verifyMTCSignature(key CosignerKey, logID []byte, start, end uint64, subtreeRoot merkle.Hash, sig mtcformat.MTCSignature) bool {
+	input, err := mtcformat.BuildSubtreeSignatureInput(sig.CosignerID, logID, start, end, subtreeRoot[:])
+	if err != nil {
+		return false
+	}
+	switch normalizeAlgorithm(key.Algorithm) {
+	case "ed25519":
+		if len(key.PublicKey) != ed25519.PublicKeySize {
+			return false
+		}
+		return ed25519.Verify(ed25519.PublicKey(key.PublicKey), input, sig.Signature)
+	case "mldsa44":
+		pk := new(mldsa44.PublicKey)
+		if err := pk.UnmarshalBinary(key.PublicKey); err != nil {
+			return false
+		}
+		return mldsa44.Verify(pk, input, nil, sig.Signature)
+	case "mldsa65":
+		pk := new(mldsa65.PublicKey)
+		if err := pk.UnmarshalBinary(key.PublicKey); err != nil {
+			return false
+		}
+		return mldsa65.Verify(pk, input, nil, sig.Signature)
+	case "mldsa87":
+		pk := new(mldsa87.PublicKey)
+		if err := pk.UnmarshalBinary(key.PublicKey); err != nil {
+			return false
+		}
+		return mldsa87.Verify(pk, input, nil, sig.Signature)
+	default:
+		return false
+	}
+}
+
+func normalizeAlgorithm(alg string) string {
+	switch strings.ToLower(strings.TrimSpace(alg)) {
+	case "ed25519":
+		return "ed25519"
+	case "mldsa44", "ml-dsa-44":
+		return "mldsa44"
+	case "mldsa65", "ml-dsa-65":
+		return "mldsa65"
+	case "mldsa87", "ml-dsa-87":
+		return "mldsa87"
+	default:
+		return ""
+	}
 }

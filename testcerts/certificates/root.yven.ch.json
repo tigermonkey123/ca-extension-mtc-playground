@@ -1,0 +1,5 @@
+{
+	"domain": "root.yven.ch",
+	"certUrl": "https://localhost:8443/acme/certificate/cF7fnCeOxluCbWpb",
+	"certStableUrl": "https://localhost:8443/acme/certificate/cF7fnCeOxluCbWpb"
+}
