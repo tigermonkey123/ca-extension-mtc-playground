@@ -18,6 +18,80 @@ The default local configuration uses:
 - cosigner signature algorithm: `mldsa44`
 - landmark allocation: `landmarks.enabled: true`
 
+## Local CA Component Map
+
+The local demo uses Docker only for the PostgreSQL state database. The
+`mtc-bridge` binary runs locally and serves both the MTC HTTP API and the ACME
+HTTPS API from the same process.
+
+```mermaid
+flowchart LR
+  subgraph Host["Local host"]
+    Make["make build"]
+    GenKey["make generate-key\nkeys/cosigner-mldsa44.key"]
+    GenCA["make generate-local-ca\nkeys/local-ca.key + keys/local-ca.pem"]
+    GenACME["./gen-demo-cert.sh\nacme-keys/acme-cert.pem + acme-key.pem"]
+    Bridge["./bin/mtc-bridge -config config.yaml\nMTC API :8080\nACME API :8443"]
+    Lego["lego / curl / demo commands\nACME client"]
+    Verify["./bin/mtc-verify-cert\nopenssl x509"]
+    TLSDemo["mtc-tls-landmark-server/client\noptional TLS demo"]
+    Files["config.yaml\nkeys/\nacme-keys/"]
+  end
+
+  subgraph Docker["Docker"]
+    PG[("postgres:16\nmtcbridge db\nport 5432")]
+  end
+
+  Make --> Bridge
+  GenKey --> Files
+  GenCA --> Files
+  GenACME --> Files
+  Files --> Bridge
+  Bridge <--> PG
+
+  Lego -- "ACME account/order/challenge/finalize CSR" --> Bridge
+  Bridge -- "append log entries,\norders, cert DER,\ncheckpoints,\nsubtree signatures,\nlandmarks" --> PG
+  Bridge -- "local CA builds MTC cert\nproof in signatureValue" --> Bridge
+  Bridge -- "PEM cert chain" --> Lego
+  Lego -- "writes cert + key" --> Files
+  Files --> Verify
+  Files --> TLSDemo
+  Verify -- "fetch checkpoint/cosigners/proofs" --> Bridge
+  TLSDemo -- "serves issued certs" --> Verify
+```
+
+Certificate issuance in the local CA flow is:
+
+```mermaid
+sequenceDiagram
+  participant Client as lego or ACME client
+  participant ACME as mtc-bridge ACME API :8443
+  participant LocalCA as local CA module
+  participant Log as issuance log / Merkle tree
+  participant Cosigner as ML-DSA-44 cosigner
+  participant DB as PostgreSQL Docker DB
+  participant MTC as mtc-bridge MTC API :8080
+
+  Client->>ACME: newAccount, newOrder, challenge validation
+  Client->>ACME: finalize order with CSR
+  ACME->>LocalCA: derive subject, SANs, validity, SPKI from CSR
+  ACME->>Log: build TBSCertificateLogEntry and append leaf
+  Log->>DB: store log entry and tree nodes
+  ACME->>Log: create checkpoint and inclusion proof
+  Log->>DB: store checkpoint
+  ACME->>Cosigner: sign subtree checkpoint
+  Cosigner-->>ACME: ML-DSA-44 subtree signature
+  ACME->>DB: store subtree signature
+  ACME->>LocalCA: build MTC certificate with proof
+  LocalCA-->>ACME: final cert DER
+  ACME->>DB: store order status and final cert DER
+  Client->>ACME: download certificate URL
+  ACME-->>Client: PEM certificate chain
+  Client->>MTC: verifier fetches checkpoint/cosigners/proofs
+  MTC->>DB: read log state and signatures
+  MTC-->>Client: verification material
+```
+
 ## Build
 
 Run from the repository root:
@@ -179,6 +253,75 @@ algorithm = 1
 sig_bytes = 2420
 ```
 
+### Revoke Issued Certificate
+
+Live local revocation writes are protected by a bearer token. Set it before
+starting the bridge:
+
+```bash
+export MTC_REVOCATION_ADMIN_TOKEN=dev-revoke-token
+./bin/mtc-bridge -config config.yaml
+```
+
+For MTC-spec certificates, the certificate serial is the Merkle log index.
+Get it from the verifier output:
+
+```bash
+./bin/mtc-verify-cert \
+  -cert testcerts/certificates/root.yven.ch.crt \
+  -bridge-url http://localhost:8080
+```
+
+Expected line:
+
+```text
+Serial/Index: <index>
+```
+
+Revoke that index without stopping the bridge:
+
+```bash
+curl -s -X POST "http://localhost:8080/revocation?id=<index>" \
+  -H "Authorization: Bearer ${MTC_REVOCATION_ADMIN_TOKEN}" \
+  | python3 -m json.tool
+```
+
+You can also send JSON:
+
+```bash
+curl -s -X POST "http://localhost:8080/revocation" \
+  -H "Authorization: Bearer ${MTC_REVOCATION_ADMIN_TOKEN}" \
+  -H "Content-Type: application/json" \
+  -d '{"index":<index>,"reason":0}' \
+  | python3 -m json.tool
+```
+
+Check the public revocation view:
+
+```bash
+curl -s "http://localhost:8080/revocation?format=json" | python3 -m json.tool
+```
+
+The binary bitmap remains available for clients:
+
+```bash
+curl -s -o /tmp/revocation.bin "http://localhost:8080/revocation"
+```
+
+After revocation, verification with `-bridge-url` should fail:
+
+```bash
+./bin/mtc-verify-cert \
+  -cert testcerts/certificates/root.yven.ch.crt \
+  -bridge-url http://localhost:8080
+```
+
+Expected output includes:
+
+```text
+[FAIL] Certificate revoked at log index <index>
+```
+
 ### Request Landmark Certificate
 
 Wait for automatic landmark allocation. The demo config uses:
@@ -300,6 +443,105 @@ For full proof verification of the exact cert file, use `mtc-verify-cert`:
 ./bin/mtc-verify-cert \
   -cert testcerts/certificates/root.yven.ch.landmark.crt \
   -bridge-url http://localhost:8080
+```
+
+### Landmark-Aware TLS Selection Demo
+
+The landmark-aware TLS demo keeps the old TLS commands available and adds a
+server/client pair that can negotiate which certificate to send. The client
+loads trusted landmark subtrees from `mtc-bridge`, advertises them with ALPN,
+and the server sends the landmark certificate only when the client supports the
+exact landmark range. Otherwise it falls back to the standalone signed cert.
+The client refreshes landmark trust every 30 minutes by default.
+
+Start the landmark-aware server immediately after normal certificate issuance.
+At this point the landmark certificate may not exist yet, and that is fine: the
+server will serve the standalone signed certificate and poll the landmark file
+path until it appears.
+
+```bash
+pkill -f mtc-tls-landmark-server || true
+
+./bin/mtc-tls-landmark-server \
+  -cert testcerts/certificates/root.yven.ch.crt \
+  -landmark-cert testcerts/certificates/root.yven.ch.landmark.crt \
+  -key testcerts/certificates/root.yven.ch.key \
+  -bridge-url http://localhost:8080 \
+  -addr :4443 \
+  -landmark-refresh 30s
+```
+
+In another terminal, run the landmark-aware client before requesting the
+landmark certificate. It should receive and verify the standalone signed
+certificate:
+
+```bash
+./bin/mtc-tls-landmark-client \
+  -url https://localhost:4443 \
+  -bridge-url http://localhost:8080 \
+  -insecure \
+  -verbose
+```
+
+Expected:
+
+```text
+Signatures:   1
+Mode:         signed
+Verification mode: standalone signed
+```
+
+After a landmark is allocated, request the landmark certificate into the path
+the server is polling:
+
+```bash
+ORDER_ID=$(docker compose exec -T postgres psql -U mtcbridge -d mtcbridge -Atc \
+"select id from acme_orders where status='valid' order by created_at desc limit 1;")
+
+curl --cacert acme-keys/acme-cert.pem \
+  -o testcerts/certificates/root.yven.ch.landmark.crt \
+  "https://localhost:8443/acme/certificate/${ORDER_ID}/landmark"
+```
+
+Wait up to `-landmark-refresh`, then run the client again. With fresh landmark
+trust, it should receive and verify the signatureless landmark certificate:
+
+```bash
+./bin/mtc-tls-landmark-client \
+  -url https://localhost:4443 \
+  -bridge-url http://localhost:8080 \
+  -insecure \
+  -verbose
+```
+
+Expected:
+
+```text
+Signatures:   0
+Mode:         signatureless
+Verification mode: signatureless landmark
+```
+
+Demonstrate fallback by disabling landmark advertisement. The server should
+send the standalone signed certificate:
+
+```bash
+./bin/mtc-tls-landmark-client \
+  -url https://localhost:4443 \
+  -bridge-url http://localhost:8080 \
+  -advertise-landmarks=false \
+  -insecure \
+  -verbose
+```
+
+The client can also cache trust material for offline fallback:
+
+```bash
+./bin/mtc-tls-landmark-client \
+  -url https://localhost:4443 \
+  -bridge-url http://localhost:8080 \
+  -cache /tmp/mtc-landmark-trust.json \
+  -insecure
 ```
 
 ### Optional: Demo Certificate With ML-DSA-44 Subject Public Key

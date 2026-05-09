@@ -13,6 +13,7 @@
 //   - GET /tile/<L>/<N>               — 256-wide hash tile at level L, tile index N
 //   - GET /tile/entries/<N>           — entry data bundle for tile index N
 //   - GET /revocation                 — revocation bitmap (extension)
+//   - POST /revocation                — protected local revocation write
 //   - GET /proof/inclusion?serial=X   — inclusion proof for certificate by serial
 //   - GET /proof/inclusion?index=N    — inclusion proof for certificate by log index
 //   - GET /proof/consistency?old=M&new=N — consistency proof between tree sizes M and N
@@ -22,12 +23,14 @@
 package tlogtiles
 
 import (
+	"crypto/subtle"
 	"database/sql"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -43,31 +46,34 @@ import (
 
 // Handler serves the tlog-tiles HTTP API.
 type Handler struct {
-	store     *store.Store
-	revMgr    *revocation.Manager
-	assertBld *assertion.Builder
-	logger    *slog.Logger
-	mux       *http.ServeMux
-	maxActive int
+	store      *store.Store
+	revMgr     *revocation.Manager
+	assertBld  *assertion.Builder
+	logger     *slog.Logger
+	mux        *http.ServeMux
+	maxActive  int
+	adminToken string
 }
 
 // New creates a new tlog-tiles Handler.
-func New(s *store.Store, revMgr *revocation.Manager, logOrigin string, logger *slog.Logger, maxActive ...int) *Handler {
+func New(s *store.Store, revMgr *revocation.Manager, logOrigin string, logger *slog.Logger, adminToken string, maxActive ...int) *Handler {
 	active := 0
 	if len(maxActive) > 0 {
 		active = maxActive[0]
 	}
 	h := &Handler{
-		store:     s,
-		revMgr:    revMgr,
-		assertBld: assertion.NewBuilder(s, logOrigin),
-		logger:    logger,
-		mux:       http.NewServeMux(),
-		maxActive: active,
+		store:      s,
+		revMgr:     revMgr,
+		assertBld:  assertion.NewBuilder(s, logOrigin),
+		logger:     logger,
+		mux:        http.NewServeMux(),
+		maxActive:  active,
+		adminToken: adminToken,
 	}
 	h.mux.HandleFunc("GET /checkpoint", h.handleCheckpoint)
 	h.mux.HandleFunc("GET /tile/", h.handleTile)
 	h.mux.HandleFunc("GET /revocation", h.handleRevocation)
+	h.mux.HandleFunc("POST /revocation", h.handleRevoke)
 	h.mux.HandleFunc("GET /proof/inclusion", h.handleInclusionProof)
 	h.mux.HandleFunc("GET /proof/consistency", h.handleConsistencyProof)
 	h.mux.HandleFunc("GET /assertion/{query}", h.handleAssertion)
@@ -236,6 +242,21 @@ func (h *Handler) handleEntryTile(w http.ResponseWriter, r *http.Request, indexP
 
 // handleRevocation serves the revocation bitmap.
 func (h *Handler) handleRevocation(w http.ResponseWriter, r *http.Request) {
+	if strings.EqualFold(r.URL.Query().Get("format"), "json") {
+		indices, err := h.revMgr.GetRevokedIndices(r.Context())
+		if err != nil {
+			h.logger.Error("serve revocation: indices", "error", err)
+			http.Error(w, "internal error", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Cache-Control", "no-cache")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"revoked_indices": indices,
+		})
+		return
+	}
+
 	treeSize, err := h.store.TreeSize(r.Context())
 	if err != nil {
 		h.logger.Error("serve revocation: tree size", "error", err)
@@ -253,6 +274,153 @@ func (h *Handler) handleRevocation(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Write(bitmap)
+}
+
+// handleRevoke records a local revocation by Merkle/log entry index.
+func (h *Handler) handleRevoke(w http.ResponseWriter, r *http.Request) {
+	if h.adminToken == "" {
+		http.Error(w, "revocation writes disabled", http.StatusServiceUnavailable)
+		return
+	}
+	if !h.authorized(r) {
+		w.Header().Set("WWW-Authenticate", `Bearer realm="mtc-revocation"`)
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	entryIdx, reason, err := parseRevokeRequest(r)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	entry, err := h.store.GetEntry(r.Context(), entryIdx)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			http.Error(w, "log entry not found", http.StatusNotFound)
+			return
+		}
+		h.logger.Error("revoke: load log entry", "entry_idx", entryIdx, "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
+	existing, alreadyRevoked, err := h.store.GetRevocation(r.Context(), entryIdx)
+	if err != nil {
+		h.logger.Error("revoke: load existing revocation", "entry_idx", entryIdx, "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
+	revokedAt := time.Now().UTC()
+	serialHex := entry.SerialHex
+	if alreadyRevoked {
+		revokedAt = existing.RevokedAt
+		reason = existing.Reason
+		serialHex = existing.SerialHex
+	} else {
+		rev := &store.RevokedIndex{
+			EntryIdx:  entryIdx,
+			SerialHex: serialHex,
+			RevokedAt: revokedAt,
+			Reason:    reason,
+		}
+		if err := h.store.AddRevocation(r.Context(), rev); err != nil {
+			h.logger.Error("revoke: add revocation", "entry_idx", entryIdx, "error", err)
+			http.Error(w, "internal error", http.StatusInternalServerError)
+			return
+		}
+		if err := h.store.EmitEvent(r.Context(), "revocation_manual", map[string]interface{}{
+			"entry_idx":  entryIdx,
+			"serial_hex": serialHex,
+			"revoked_at": revokedAt,
+			"reason":     reason,
+		}); err != nil {
+			h.logger.Warn("revoke: emit event", "entry_idx", entryIdx, "error", err)
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"entry_idx":       entryIdx,
+		"serial_hex":      serialHex,
+		"revoked_at":      revokedAt.Format(time.RFC3339),
+		"reason":          reason,
+		"already_revoked": alreadyRevoked,
+	})
+}
+
+func (h *Handler) authorized(r *http.Request) bool {
+	const prefix = "Bearer "
+	auth := r.Header.Get("Authorization")
+	if !strings.HasPrefix(auth, prefix) {
+		return false
+	}
+	token := strings.TrimSpace(strings.TrimPrefix(auth, prefix))
+	if len(token) != len(h.adminToken) {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(token), []byte(h.adminToken)) == 1
+}
+
+func parseRevokeRequest(r *http.Request) (int64, int16, error) {
+	var (
+		entryIdx *int64
+		reason   int16
+	)
+
+	if raw := r.URL.Query().Get("id"); raw != "" {
+		idx, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil {
+			return 0, 0, fmt.Errorf("invalid id")
+		}
+		entryIdx = &idx
+	}
+	if raw := r.URL.Query().Get("reason"); raw != "" {
+		parsed, err := parseRevocationReason(raw)
+		if err != nil {
+			return 0, 0, err
+		}
+		reason = parsed
+	}
+
+	if entryIdx == nil && r.Body != nil {
+		var body struct {
+			Index  *int64 `json:"index"`
+			Reason *int   `json:"reason"`
+		}
+		dec := json.NewDecoder(r.Body)
+		if err := dec.Decode(&body); err != nil && !errors.Is(err, io.EOF) {
+			return 0, 0, fmt.Errorf("invalid JSON body")
+		}
+		if body.Index != nil {
+			entryIdx = body.Index
+		}
+		if body.Reason != nil {
+			parsed, err := parseRevocationReason(strconv.Itoa(*body.Reason))
+			if err != nil {
+				return 0, 0, err
+			}
+			reason = parsed
+		}
+	}
+
+	if entryIdx == nil {
+		return 0, 0, fmt.Errorf("missing revocation id")
+	}
+	if *entryIdx < 0 {
+		return 0, 0, fmt.Errorf("invalid id")
+	}
+	return *entryIdx, reason, nil
+}
+
+func parseRevocationReason(raw string) (int16, error) {
+	reason, err := strconv.ParseInt(raw, 10, 16)
+	if err != nil || reason < 0 {
+		return 0, fmt.Errorf("invalid reason")
+	}
+	return int16(reason), nil
 }
 
 // InclusionProofResponse is the JSON response for the inclusion proof API.

@@ -22,6 +22,7 @@ help:
 	@echo "  conformance      Run conformance test suite against a running server"
 	@echo "  interop          Cross-validate against bwesterb/mtc reference implementation"
 	@echo "  demo-tls         Run TLS assertion stapling demo (requires running bridge + CA)"
+	@echo "  mtc-tls-landmark-server/client are built by the build target for landmark-aware TLS demos"
 	@echo "  demo-embedded    Run embedded MTC proof demo (standalone, no server needed)"
 	@echo "  demo-mtc         Run MTC-spec cert demo (id-alg-mtcProof, standalone)"
 	@echo "  docker           Build Docker image"
@@ -37,10 +38,12 @@ build:
 	go build -o bin/mtc-assertion ./cmd/mtc-assertion/
 	go build -o bin/mtc-tls-server ./cmd/mtc-tls-server/
 	go build -o bin/mtc-tls-verify ./cmd/mtc-tls-verify/
+	go build -o bin/mtc-tls-landmark-server ./cmd/mtc-tls-landmark-server/
+	go build -o bin/mtc-tls-landmark-client ./cmd/mtc-tls-landmark-client/
 	go build -o bin/mtc-verify-cert ./cmd/mtc-verify-cert/
 	go build -o bin/demo-embedded-cert ./cmd/demo-embedded-cert/
 	go build -o bin/mtc-interop ./cmd/mtc-interop/
-	@echo "Built: bin/mtc-bridge, bin/mtc-conformance, bin/mtc-assertion, bin/mtc-tls-server, bin/mtc-tls-verify, bin/mtc-verify-cert, bin/demo-embedded-cert, bin/mtc-interop"
+	@echo "Built: bin/mtc-bridge, bin/mtc-conformance, bin/mtc-assertion, bin/mtc-tls-server, bin/mtc-tls-verify, bin/mtc-tls-landmark-server, bin/mtc-tls-landmark-client, bin/mtc-verify-cert, bin/demo-embedded-cert, bin/mtc-interop"
 
 # Test
 test:

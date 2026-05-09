@@ -59,6 +59,9 @@ type Config struct {
 
 	// Landmarks configures automatic landmark allocation.
 	Landmarks LandmarkConfig `yaml:"landmarks"`
+
+	// Revocation configures local revocation administration.
+	Revocation RevocationConfig `yaml:"revocation"`
 }
 
 // ACMEConfig configures the ACME server.
@@ -136,6 +139,13 @@ type LandmarkConfig struct {
 	// MaxActiveLandmarks limits publication to the most recent N landmarks. A
 	// zero value publishes all landmarks.
 	MaxActiveLandmarks int `yaml:"max_active_landmarks"`
+}
+
+// RevocationConfig configures local revocation administration.
+type RevocationConfig struct {
+	// AdminToken protects live revocation mutation endpoints. When empty, live
+	// revocation writes are disabled.
+	AdminToken string `yaml:"admin_token"`
 }
 
 // IsEnabled returns whether the assertion issuer is enabled.

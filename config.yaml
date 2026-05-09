@@ -70,6 +70,9 @@ landmarks:
   interval: 1m
   max_active_landmarks: 0  # 0 = publish all landmarks
 
+revocation:
+  admin_token: "${MTC_REVOCATION_ADMIN_TOKEN:-}"
+
 local_ca:
   enabled: true
   mtc_mode: true

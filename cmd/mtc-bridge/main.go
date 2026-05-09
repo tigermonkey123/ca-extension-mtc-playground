@@ -234,7 +234,7 @@ func main() {
 	}
 
 	// Create HTTP handlers.
-	tlogHandler := tlogtiles.New(stateStore, revMgr, cfg.Log.Origin, logger.With("component", "tlogtiles"), cfg.Landmarks.MaxActiveLandmarks)
+	tlogHandler := tlogtiles.New(stateStore, revMgr, cfg.Log.Origin, logger.With("component", "tlogtiles"), cfg.Revocation.AdminToken, cfg.Landmarks.MaxActiveLandmarks)
 	acmeExtURL := ""
 	if cfg.ACME.Enabled {
 		acmeExtURL = cfg.ACME.ExternalURL

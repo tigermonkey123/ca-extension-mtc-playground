@@ -164,6 +164,8 @@ ca_db:
   password: testdbpass
 cosigner:
   key_file: /tmp/key.pem
+revocation:
+  admin_token: test-token
 `
 	tmpFile, err := os.CreateTemp("", "config-*.yaml")
 	if err != nil {
@@ -186,6 +188,9 @@ cosigner:
 	}
 	if cfg.CADB.Host != "ca-db" {
 		t.Errorf("ca_db host = %q, want %q", cfg.CADB.Host, "ca-db")
+	}
+	if cfg.Revocation.AdminToken != "test-token" {
+		t.Errorf("revocation admin token = %q, want %q", cfg.Revocation.AdminToken, "test-token")
 	}
 	if err := cfg.Validate(); err != nil {
 		t.Errorf("unexpected validation error: %v", err)

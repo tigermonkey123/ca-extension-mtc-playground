@@ -572,6 +572,22 @@ func (s *Store) AddRevocation(ctx context.Context, rev *RevokedIndex) error {
 	return nil
 }
 
+// GetRevocation retrieves a revocation record by log entry index.
+func (s *Store) GetRevocation(ctx context.Context, entryIdx int64) (*RevokedIndex, bool, error) {
+	var rev RevokedIndex
+	err := s.db.QueryRowContext(ctx,
+		`SELECT entry_idx, serial_hex, revoked_at, reason
+		 FROM revoked_indices WHERE entry_idx = $1`, entryIdx).
+		Scan(&rev.EntryIdx, &rev.SerialHex, &rev.RevokedAt, &rev.Reason)
+	if err == sql.ErrNoRows {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, fmt.Errorf("store.GetRevocation: %w", err)
+	}
+	return &rev, true, nil
+}
+
 // GetRevokedIndices returns all revoked entry indices.
 func (s *Store) GetRevokedIndices(ctx context.Context) ([]int64, error) {
 	rows, err := s.db.QueryContext(ctx,

@@ -156,6 +156,7 @@ func verifyMTCFormat(certDER []byte) {
 		fmt.Println()
 		fmt.Println("--- Bridge Checkpoint ---")
 		verifyMTCCheckpoint(parsed)
+		checkRevocation(parsed.SerialNumber)
 	}
 }
 
@@ -352,7 +353,59 @@ func verifyLegacyFormat(certDER []byte) {
 		fmt.Println()
 		fmt.Println("--- Bridge Checkpoint ---")
 		verifyCheckpoint(proof)
+		checkRevocation(proof.LeafIndex)
 	}
+}
+
+func checkRevocation(leafIndex int64) {
+	fmt.Println()
+	fmt.Println("--- Revocation ---")
+
+	revoked, err := fetchRevocationStatus(leafIndex)
+	if err != nil {
+		fmt.Printf("[WARN] Could not check revocation status: %v\n", err)
+		return
+	}
+	if revoked {
+		fmt.Printf("[FAIL] Certificate revoked at log index %d\n", leafIndex)
+		os.Exit(1)
+	}
+	fmt.Printf("[PASS] Certificate not revoked at log index %d\n", leafIndex)
+}
+
+func fetchRevocationStatus(leafIndex int64) (bool, error) {
+	if leafIndex < 0 {
+		return false, fmt.Errorf("invalid negative log index %d", leafIndex)
+	}
+
+	url := strings.TrimRight(*bridgeURL, "/") + "/revocation"
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Get(url)
+	if err != nil {
+		return false, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return false, fmt.Errorf("bridge returned %d for /revocation", resp.StatusCode)
+	}
+
+	bitmap, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return false, err
+	}
+	return revocationBitmapHasIndex(bitmap, leafIndex), nil
+}
+
+func revocationBitmapHasIndex(bitmap []byte, leafIndex int64) bool {
+	if leafIndex < 0 {
+		return false
+	}
+	byteIdx := leafIndex / 8
+	if byteIdx < 0 || byteIdx >= int64(len(bitmap)) {
+		return false
+	}
+	bitIdx := uint(7 - leafIndex%8)
+	return bitmap[byteIdx]&(1<<bitIdx) != 0
 }
 
 func verifyCheckpoint(proof *localca.InclusionProofExt) {
